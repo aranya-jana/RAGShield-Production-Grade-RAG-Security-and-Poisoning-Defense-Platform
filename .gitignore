@@ -1,0 +1,88 @@
+# =========================
+# Python
+# =========================
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# =========================
+# Secrets & Environment
+# =========================
+.keys
+.env
+.env.bak
+.env.*.bak
+*.pem
+*.key
+
+# =========================
+# Local Models
+# =========================
+models/
+
+# =========================
+# HuggingFace / ML Cache
+# =========================
+.cache/
+
+# =========================
+# Logs
+# =========================
+logs/
+*.log
+
+# =========================
+# Local RAG / Vector Data
+# =========================
+data/
+
+# =========================
+# Generated Demo Output
+# =========================
+*.out
+
+# =========================
+# Frontend
+# =========================
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+
+# =========================
+# Local / Temporary Files
+# =========================
+*.local
+*.tmp
+*.temp
+
+# =========================
+# IDE
+# =========================
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# =========================
+# OS
+# =========================
+.DS_Store
+Thumbs.db
+
+# =========================
+# Python Tooling
+# =========================
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# =========================
+# Build / Distribution
+# =========================
+build/
+dist/
+*.egg-info/
