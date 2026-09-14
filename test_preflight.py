@@ -472,9 +472,24 @@ class TestEnvHandling(unittest.TestCase):
             self.assertEqual(written["OPENAI_COMPAT_BASE_URL"], "http://localhost:8080")
             self.assertIn("OPENAI_COMPAT_MODEL", written)
             self.assertEqual(written["EXISTING"], "1")  # unrelated keys survive
-            # A backup of a credential-bearing file must not be group/world readable.
-            mode = os.stat(path + ".bak").st_mode & 0o777
-            self.assertEqual(mode, 0o600, "backup mode is %o" % mode)
+            # A backup of a credential-bearing file must be protected.
+            #
+            # POSIX exposes owner/group/other permission bits through
+            # st_mode. Windows does not implement equivalent Unix
+            # permission semantics through os.chmod(), so the numeric
+            # mode assertion is only meaningful on POSIX.
+            backup = path + ".bak"
+            self.assertTrue(
+                os.path.isfile(backup),
+                "backup file was not created",
+            )
+            if os.name == "posix":
+                mode = os.stat(backup).st_mode & 0o777
+                self.assertEqual(
+                    mode,
+                    0o600,
+                    "backup mode is %o" % mode,
+                )
 
     def test_load_env_strips_inline_comments_and_quotes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -501,19 +516,81 @@ class TestEnvHandling(unittest.TestCase):
 class TestStdlibOnly(unittest.TestCase):
     def test_preflight_imports_nothing_third_party(self):
         """
-        preflight must report a missing dependency, so it cannot have any.
+        Import preflight in a fresh Python interpreter and verify that it
+        loads no third-party modules.
+
+        This test uses a subprocess because pytest itself loads third-party
+        packages into the parent interpreter before this test executes.
         """
-        stdlib = set(getattr(sys, "stdlib_module_names", ()))
-        if not stdlib:
-            self.skipTest("sys.stdlib_module_names needs Python 3.10+")
-        allowed = stdlib | {"preflight", "sitecustomize", "_distutils_hack"}
-        offenders = sorted(
-            name.split(".")[0] for name in list(sys.modules)
-            if not name.startswith("_")
-            and not name.startswith("test_")   # the harness itself, under discover
-            and name.split(".")[0] not in allowed
-            and "." not in name)
-        self.assertEqual(offenders, [], "third-party modules loaded: %s" % offenders)
+        import subprocess
+
+        root = os.path.dirname(os.path.abspath(__file__))
+        src_dir = os.path.join(root, "src")
+
+        script = r"""
+import json
+import sys
+
+stdlib = set(getattr(sys, "stdlib_module_names", ()))
+if not stdlib:
+    print(json.dumps({"error": "sys.stdlib_module_names unavailable"}))
+    raise SystemExit(2)
+
+import preflight
+
+allowed = stdlib | {
+    "preflight",
+    "sitecustomize",
+    "_distutils_hack",
+}
+
+offenders = sorted(
+    name.split(".")[0]
+    for name in list(sys.modules)
+    if not name.startswith("_")
+    and name.split(".")[0] not in allowed
+    and "." not in name
+)
+
+print(json.dumps({"offenders": offenders}))
+"""
+
+        env = os.environ.copy()
+        existing_pythonpath = env.get("PYTHONPATH")
+        if existing_pythonpath:
+            env["PYTHONPATH"] = src_dir + os.pathsep + existing_pythonpath
+        else:
+            env["PYTHONPATH"] = src_dir
+
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=False,
+        )
+
+        self.assertEqual(
+            completed.returncode,
+            0,
+            "fresh interpreter failed:\nstdout=%s\nstderr=%s"
+            % (completed.stdout, completed.stderr),
+        )
+
+        try:
+            result = json.loads(completed.stdout.strip())
+        except json.JSONDecodeError as exc:
+            self.fail(
+                "fresh interpreter returned invalid JSON: %s\n"
+                "stdout=%s\nstderr=%s"
+                % (exc, completed.stdout, completed.stderr)
+            )
+
+        self.assertEqual(
+            result.get("offenders"),
+            [],
+            "third-party modules loaded: %s" % result.get("offenders"),
+        )
 
 
 if __name__ == "__main__":
