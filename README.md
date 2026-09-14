@@ -1,4 +1,4 @@
-<h1 align="center">
+<!-- <h1 align="center">
   <img src="resources/prompt-icon.svg" alt="prompt-icon">
 The Hidden Parrot: RAG Poisoning POC  <img src="resources/prompt-icon.svg" alt="prompt-icon">
 </h1>
@@ -191,4 +191,4 @@ The complete research paper is contained in `research_paper/index.qmd` and organ
 
 ---
 
-**⚠️ Responsible Research Notice**: This work is intended for legitimate security research and educational purposes. Please use these techniques responsibly and in accordance with applicable laws and ethical guidelines.
+**⚠️ Responsible Research Notice**: This work is intended for legitimate security research and educational purposes. Please use these techniques responsibly and in accordance with applicable laws and ethical guidelines. -->
