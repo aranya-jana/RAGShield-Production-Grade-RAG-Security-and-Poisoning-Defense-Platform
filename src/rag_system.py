@@ -29,6 +29,11 @@ try:
 except ImportError:
     from document_injection_detector import DocumentInjectionDetector
 
+try:
+    from src.risk_engine import RiskTrustEngine, RiskAssessment
+except ImportError:
+    from risk_engine import RiskTrustEngine, RiskAssessment
+
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +95,12 @@ class RAGSystem:
         # Document-level prompt-injection scanner.
         # Document content and metadata are treated as untrusted input.
         self.document_injection_detector = DocumentInjectionDetector()
+
+        # --------------------------------------------------------------
+        # Risk & trust engine
+        # --------------------------------------------------------------
+
+        self.risk_trust_engine = RiskTrustEngine()
 
         # --------------------------------------------------------------
         # Contradiction detector
@@ -298,6 +309,58 @@ class RAGSystem:
             metadata=metadata,
         )
 
+    def _assess_document_risk(
+        self,
+        injection_score: float = 0.0,
+        poisoning_score: float = 0.0,
+        contradiction_score: float = 0.0,
+        metadata_score: float = 0.0,
+    ) -> RiskAssessment:
+        """Calculate normalized risk and trust for one document."""
+        if not hasattr(self, "risk_trust_engine"):
+            self.risk_trust_engine = RiskTrustEngine()
+
+        return self.risk_trust_engine.assess(
+            injection_score=injection_score,
+            poisoning_score=poisoning_score,
+            contradiction_score=contradiction_score,
+            metadata_score=metadata_score,
+        )
+
+    @staticmethod
+    def _metadata_risk_score(document) -> float:
+        """Detect instruction-like metadata without trusting document labels."""
+        metadata = dict(getattr(document, "metadata", {}) or {})
+        suspicious_keys = {
+            "instruction",
+            "instructions",
+            "system_prompt",
+            "system_instruction",
+            "prompt",
+            "override",
+            "role",
+            "command",
+            "payload",
+        }
+        suspicious_markers = (
+            "ignore previous instructions",
+            "ignore all previous instructions",
+            "system instruction",
+            "critical system instruction",
+        )
+
+        for key, value in metadata.items():
+            key_text = str(key).strip().lower().replace("-", "_")
+            value_text = str(value).strip().lower()
+
+            if key_text in suspicious_keys:
+                return 1.0
+
+            if any(marker in value_text for marker in suspicious_markers):
+                return 1.0
+
+        return 0.0
+
     def setup_vector_database(
         self,
         include_poison: bool = False,
@@ -368,6 +431,13 @@ class RAGSystem:
             injection_detection = self._analyze_document_security(doc)
             source = doc.metadata.get("source", "unknown")
 
+            risk_assessment = self._assess_document_risk(
+                injection_score=float(
+                    getattr(injection_detection, "score", 0.0)
+                ),
+                metadata_score=self._metadata_risk_score(doc),
+            )
+
             if injection_detection.is_injected:
                 quarantined_docs.append(doc)
 
@@ -403,6 +473,9 @@ class RAGSystem:
                     metadata={
                         "stage": "ingestion",
                         "trusted": False,
+                        "risk_score": risk_assessment.risk_score,
+                        "trust_score": risk_assessment.trust_score,
+                        "classification": risk_assessment.classification,
                     },
                 )
 
@@ -440,6 +513,9 @@ class RAGSystem:
                 metadata={
                     "stage": "ingestion",
                     "trusted": True,
+                    "risk_score": risk_assessment.risk_score,
+                    "trust_score": risk_assessment.trust_score,
+                    "classification": risk_assessment.classification,
                 },
             )
 
@@ -636,6 +712,32 @@ class RAGSystem:
                 )
 
             # ----------------------------------------------------------
+            # Risk & trust assessment
+            # ----------------------------------------------------------
+
+            poison_risk = self._assess_document_risk(
+                injection_score=injection_score,
+                poisoning_score=float(poison_detection.score),
+                contradiction_score=float(contradiction_detection.score),
+                metadata_score=self._metadata_risk_score(poisoned_doc),
+            )
+
+            logger.info(
+                "Risk assessment: risk=%.2f trust=%.2f classification=%s",
+                poison_risk.risk_score,
+                poison_risk.trust_score,
+                poison_risk.classification,
+            )
+
+            print("\nRiskTrustEngine")
+            print(f"Risk score: {poison_risk.risk_score:.2f}")
+            print(f"Trust score: {poison_risk.trust_score:.2f}")
+            print(f"Classification: {poison_risk.classification}")
+
+            for reason in poison_risk.reasons:
+                print(f"  - {reason}")
+
+            # ----------------------------------------------------------
             # Audit the poisoning analysis
             # ----------------------------------------------------------
 
@@ -661,6 +763,9 @@ class RAGSystem:
                     ),
                     metadata={
                         "stage": "injection_analysis",
+                        "risk_score": poison_risk.risk_score,
+                        "trust_score": poison_risk.trust_score,
+                        "classification": poison_risk.classification,
                     },
                 )
 
@@ -686,6 +791,9 @@ class RAGSystem:
                     ),
                     metadata={
                         "stage": "injection_analysis",
+                        "risk_score": poison_risk.risk_score,
+                        "trust_score": poison_risk.trust_score,
+                        "classification": poison_risk.classification,
                     },
                 )
 
@@ -707,6 +815,9 @@ class RAGSystem:
                     reasons=[],
                     metadata={
                         "stage": "injection_analysis",
+                        "risk_score": poison_risk.risk_score,
+                        "trust_score": poison_risk.trust_score,
+                        "classification": poison_risk.classification,
                     },
                 )
 
@@ -849,6 +960,8 @@ class RAGSystem:
                 ),
             )
 
+            metadata_score = self._metadata_risk_score(doc)
+
             # ----------------------------------------------------------
             # Document injection detection
             # ----------------------------------------------------------
@@ -879,6 +992,11 @@ class RAGSystem:
                 "is_injected",
                 False,
             ):
+                injection_risk = self._assess_document_risk(
+                    injection_score=injection_score,
+                    metadata_score=metadata_score,
+                )
+
                 blocked_documents.append(doc)
 
                 event = {
@@ -890,6 +1008,9 @@ class RAGSystem:
                     "is_contradictory": False,
                     "is_injected": True,
                     "reasons": injection_reasons,
+                    "risk_score": injection_risk.risk_score,
+                    "trust_score": injection_risk.trust_score,
+                    "classification": injection_risk.classification,
                     "status": "BLOCKED",
                 }
 
@@ -907,6 +1028,9 @@ class RAGSystem:
                     metadata={
                         "stage": "retrieval",
                         "reason": "document_injection",
+                        "risk_score": injection_risk.risk_score,
+                        "trust_score": injection_risk.trust_score,
+                        "classification": injection_risk.classification,
                     },
                 )
 
@@ -936,6 +1060,11 @@ class RAGSystem:
 
             if poison_detection.is_poisoned:
 
+                poison_risk = self._assess_document_risk(
+                    poisoning_score=float(poison_detection.score),
+                    metadata_score=metadata_score,
+                )
+
                 blocked_documents.append(
                     doc
                 )
@@ -949,9 +1078,13 @@ class RAGSystem:
                     ),
                     "is_poisoned": True,
                     "is_contradictory": False,
+                    "is_injected": False,
                     "reasons": list(
                         poison_detection.reasons
                     ),
+                    "risk_score": poison_risk.risk_score,
+                    "trust_score": poison_risk.trust_score,
+                    "classification": poison_risk.classification,
                     "status": "BLOCKED",
                 }
 
@@ -975,6 +1108,9 @@ class RAGSystem:
                     ),
                     metadata={
                         "stage": "retrieval",
+                        "risk_score": poison_risk.risk_score,
+                        "trust_score": poison_risk.trust_score,
+                        "classification": poison_risk.classification,
                     },
                 )
 
@@ -1009,6 +1145,13 @@ class RAGSystem:
 
             if contradiction_detection.is_contradictory:
 
+                contradiction_risk = self._assess_document_risk(
+                    contradiction_score=float(
+                        contradiction_detection.score
+                    ),
+                    metadata_score=metadata_score,
+                )
+
                 blocked_documents.append(
                     doc
                 )
@@ -1022,9 +1165,13 @@ class RAGSystem:
                     ),
                     "is_poisoned": False,
                     "is_contradictory": True,
+                    "is_injected": False,
                     "reasons": list(
                         contradiction_detection.reasons
                     ),
+                    "risk_score": contradiction_risk.risk_score,
+                    "trust_score": contradiction_risk.trust_score,
+                    "classification": contradiction_risk.classification,
                     "status": "BLOCKED",
                 }
 
@@ -1048,6 +1195,9 @@ class RAGSystem:
                     ),
                     metadata={
                         "stage": "retrieval",
+                        "risk_score": contradiction_risk.risk_score,
+                        "trust_score": contradiction_risk.trust_score,
+                        "classification": contradiction_risk.classification,
                     },
                 )
 
@@ -1068,8 +1218,17 @@ class RAGSystem:
                 continue
 
             # ----------------------------------------------------------
-            # Document passed both detectors
+            # Document passed all security detectors
             # ----------------------------------------------------------
+
+            safe_risk = self._assess_document_risk(
+                injection_score=injection_score,
+                poisoning_score=float(poison_detection.score),
+                contradiction_score=float(
+                    contradiction_detection.score
+                ),
+                metadata_score=metadata_score,
+            )
 
             safe_documents.append(
                 doc
@@ -1083,7 +1242,10 @@ class RAGSystem:
                 "is_poisoned": False,
                 "is_contradictory": False,
                 "is_injected": False,
-                "reasons": [],
+                "reasons": list(safe_risk.reasons),
+                "risk_score": safe_risk.risk_score,
+                "trust_score": safe_risk.trust_score,
+                "classification": safe_risk.classification,
                 "status": "SAFE",
             }
 
@@ -1103,6 +1265,9 @@ class RAGSystem:
                 reasons=[],
                 metadata={
                     "stage": "retrieval",
+                    "risk_score": safe_risk.risk_score,
+                    "trust_score": safe_risk.trust_score,
+                    "classification": safe_risk.classification,
                 },
             )
 
@@ -1226,6 +1391,7 @@ class RAGSystem:
                     blocked_documents
                 ),
                 "llm_called": True,
+                "risk_engine": "RiskTrustEngine",
             },
         )
 
