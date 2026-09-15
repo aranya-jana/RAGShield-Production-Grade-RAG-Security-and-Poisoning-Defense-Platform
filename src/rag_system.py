@@ -34,6 +34,11 @@ try:
 except ImportError:
     from risk_engine import RiskTrustEngine, RiskAssessment
 
+try:
+    from src.prompt_injection_detector import PromptInjectionDetector
+except ImportError:
+    from prompt_injection_detector import PromptInjectionDetector
+
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +106,16 @@ class RAGSystem:
         # --------------------------------------------------------------
 
         self.risk_trust_engine = RiskTrustEngine()
+
+        # --------------------------------------------------------------
+        # User prompt injection detector
+        # --------------------------------------------------------------
+        #
+        # User queries are treated as untrusted input and analyzed before
+        # they are allowed to participate in the protected RAG workflow.
+        # Blocking behavior is intentionally added in a later integration
+        # step after the detector itself has been validated.
+        self.prompt_injection_detector = PromptInjectionDetector()
 
         # --------------------------------------------------------------
         # Contradiction detector
@@ -308,6 +323,13 @@ class RAGSystem:
             ) or "",
             metadata=metadata,
         )
+
+    def _analyze_prompt_security(self, prompt: str):
+        """Analyze a user query for prompt injection attempts."""
+        if not hasattr(self, "prompt_injection_detector"):
+            self.prompt_injection_detector = PromptInjectionDetector()
+
+        return self.prompt_injection_detector.analyze(prompt)
 
     def _assess_document_risk(
         self,
@@ -890,6 +912,134 @@ class RAGSystem:
         # Reset per-query state.
         self.last_prompt = ""
         self.security_events = []
+
+        # --------------------------------------------------------------
+        # Prompt injection security boundary
+        # --------------------------------------------------------------
+        #
+        # User-controlled input is analyzed BEFORE retrieval and BEFORE
+        # the LLM is invoked. A blocked prompt must never reach the LLM.
+        # This is intentionally separate from document-level security: a
+        # safe user query may retrieve malicious documents, and those are
+        # still handled by the existing retrieval security pipeline below.
+        # --------------------------------------------------------------
+
+        prompt_detection = self._analyze_prompt_security(query_text)
+        prompt_score = float(
+            getattr(
+                prompt_detection,
+                "score",
+                0.0,
+            )
+        )
+        prompt_reasons = list(
+            getattr(
+                prompt_detection,
+                "reasons",
+                [],
+            ) or []
+        )
+        prompt_patterns = list(
+            getattr(
+                prompt_detection,
+                "matched_patterns",
+                [],
+            ) or []
+        )
+
+        if getattr(
+            prompt_detection,
+            "is_injected",
+            False,
+        ):
+            prompt_event = {
+                "source": "user_query",
+                "document_type": "prompt",
+                "detector": "PromptInjectionDetector",
+                "score": prompt_score,
+                "is_poisoned": False,
+                "is_contradictory": False,
+                "is_injected": True,
+                "reasons": prompt_reasons,
+                "matched_patterns": prompt_patterns,
+                "status": "BLOCKED",
+            }
+
+            self.security_events.append(prompt_event)
+
+            self._write_audit_event(
+                event_type="prompt_injection_detected",
+                query=query_text,
+                source="user_query",
+                document_type="prompt",
+                detector="PromptInjectionDetector",
+                score=prompt_score,
+                status="BLOCKED",
+                reasons=prompt_reasons,
+                metadata={
+                    "stage": "input",
+                    "matched_patterns": prompt_patterns,
+                    "llm_called": False,
+                    "retrieval_started": False,
+                },
+            )
+
+            self._write_audit_event(
+                event_type="query_blocked",
+                query=query_text,
+                source="user_query",
+                document_type="prompt",
+                detector="PromptInjectionDetector",
+                score=prompt_score,
+                status="BLOCKED",
+                reasons=prompt_reasons
+                or [
+                    "Prompt injection detected at the input security boundary."
+                ],
+                metadata={
+                    "stage": "input",
+                    "matched_patterns": prompt_patterns,
+                    "llm_called": False,
+                    "retrieval_started": False,
+                },
+            )
+
+            logger.warning(
+                "Blocked prompt injection attempt (score=%.2f)",
+                prompt_score,
+            )
+
+            return {
+                "query": query_text,
+                "result": (
+                    "I could not process this request because the input "
+                    "was blocked by the prompt injection protection layer."
+                ),
+                "source_documents": [],
+                "blocked_documents": [],
+                "security_events": self.security_events,
+            }
+
+        # --------------------------------------------------------------
+        # Audit clean input
+        # --------------------------------------------------------------
+
+        self._write_audit_event(
+            event_type="prompt_security_clean",
+            query=query_text,
+            source="user_query",
+            document_type="prompt",
+            detector="PromptInjectionDetector",
+            score=prompt_score,
+            status="SAFE",
+            reasons=[],
+            metadata={
+                "stage": "input",
+                "matched_patterns": prompt_patterns,
+                "llm_called": False,
+                "retrieval_started": True,
+            },
+        )
 
         # --------------------------------------------------------------
         # Retrieve
