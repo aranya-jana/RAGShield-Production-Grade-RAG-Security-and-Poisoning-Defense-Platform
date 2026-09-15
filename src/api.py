@@ -33,6 +33,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+from src.security_middleware import SecurityHeadersMiddleware
 
 try:
     from src.rate_limiter import RateLimiter
@@ -102,6 +103,14 @@ app = FastAPI(
         "with instruction poisoning and factual contradiction detection."
     ),
     version="1.0.0",
+)
+
+# ============================================================================
+# HTTP SECURITY HEADERS
+# ============================================================================
+
+app.add_middleware(
+    SecurityHeadersMiddleware,
 )
 
 
