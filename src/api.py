@@ -34,7 +34,10 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-
+try:
+    from src.rate_limiter import RateLimiter
+except ImportError:
+    from rate_limiter import RateLimiter
 # ============================================================================
 # LOGGING
 # ============================================================================
@@ -120,6 +123,36 @@ user_store = UserStore()
 token_manager = TokenManager()
 
 rbac = RBAC()
+
+# ============================================================================
+# API RATE LIMITING
+# ============================================================================
+
+# Endpoint-specific limits for authenticated expensive operations.
+#
+# These limits are intentionally conservative for the local deployment.
+# A multi-worker production deployment should use a shared limiter such
+# as Redis instead of process-local state.
+
+rate_limiter = RateLimiter(
+    max_clients=10_000,
+    cleanup_interval_seconds=60,
+)
+
+RATE_LIMITS = {
+    "query": {
+        "limit": 10,
+        "window_seconds": 60,
+    },
+    "attack": {
+        "limit": 20,
+        "window_seconds": 60,
+    },
+    "setup": {
+        "limit": 5,
+        "window_seconds": 60,
+    },
+}
 
 
 def get_current_principal(
@@ -251,6 +284,83 @@ def require_admin(
 
     return principal
 
+def enforce_rate_limit(
+    scope: str,
+):
+    """
+    Create a FastAPI dependency for an endpoint-specific rate limit.
+
+    Rate limiting is keyed by the authenticated username.
+
+    No token, password, query, attack payload, or request body is stored
+    by the rate limiter.
+    """
+
+    if scope not in RATE_LIMITS:
+        raise ValueError(
+            f"Unknown rate-limit scope: {scope}"
+        )
+
+    settings = RATE_LIMITS[scope]
+
+    def dependency(
+        principal: AuthenticatedPrincipal = Depends(
+            get_current_principal
+        ),
+    ) -> AuthenticatedPrincipal:
+
+        username = getattr(
+            principal,
+            "username",
+            None,
+        )
+
+        if not username:
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required.",
+                headers={
+                    "WWW-Authenticate": "Bearer",
+                },
+            )
+
+        decision = rate_limiter.check(
+            client_key=f"user:{username}",
+            scope=scope,
+            limit=settings["limit"],
+            window_seconds=settings[
+                "window_seconds"
+            ],
+        )
+
+        if not decision.allowed:
+
+            logger.warning(
+                "Rate limit exceeded: scope=%s user=%s",
+                scope,
+                username,
+            )
+
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "Rate limit exceeded. "
+                    "Please retry later."
+                ),
+                headers={
+                    "Retry-After": str(
+                        decision.retry_after_seconds
+                    ),
+                    "X-RateLimit-Limit": str(
+                        decision.limit
+                    ),
+                    "X-RateLimit-Remaining": "0",
+                },
+            )
+
+        return principal
+
+    return dependency
 
 # ============================================================================
 # CORS
@@ -979,6 +1089,9 @@ def setup(
     principal: AuthenticatedPrincipal = Depends(
         require_permission("manage_documents")
     ),
+    _rate_limit_principal: AuthenticatedPrincipal = Depends(
+        enforce_rate_limit("setup")
+    ),
 ):
     """
     Reset the vector database and optionally inject a poisoned document.
@@ -1084,6 +1197,9 @@ def attack(
     request: AttackRequest,
     principal: AuthenticatedPrincipal = Depends(
         require_permission("run_red_team")
+    ),
+    _rate_limit_principal: AuthenticatedPrincipal = Depends(
+        enforce_rate_limit("attack")
     ),
 ):
     """
@@ -1314,6 +1430,9 @@ def query(
     request: QueryRequest,
     principal: AuthenticatedPrincipal = Depends(
         require_permission("query")
+    ),
+    _rate_limit_principal: AuthenticatedPrincipal = Depends(
+        enforce_rate_limit("query")
     ),
 ):
     """
