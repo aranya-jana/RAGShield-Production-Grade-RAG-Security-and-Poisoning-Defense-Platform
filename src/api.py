@@ -29,7 +29,8 @@ import time
 import uuid
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -58,6 +59,15 @@ try:
     )
     from src.rag_system import RAGSystem
     from src.audit_logger import SecurityAuditLogger
+    from src.auth import (
+        AuthenticatedPrincipal,
+        AuthenticationError,
+        AuthorizationError,
+        TokenValidationError,
+        RBAC,
+        TokenManager,
+        UserStore,
+    )
 
 except ImportError:
     from config import Config
@@ -67,6 +77,15 @@ except ImportError:
     )
     from rag_system import RAGSystem
     from audit_logger import SecurityAuditLogger
+    from auth import (
+        AuthenticatedPrincipal,
+        AuthenticationError,
+        AuthorizationError,
+        TokenValidationError,
+        RBAC,
+        TokenManager,
+        UserStore,
+    )
 
 
 # ============================================================================
@@ -81,6 +100,156 @@ app = FastAPI(
     ),
     version="1.0.0",
 )
+
+
+# ============================================================================
+# AUTHENTICATION / RBAC
+# ============================================================================
+
+bearer_scheme = HTTPBearer(
+    auto_error=False,
+)
+
+# Local-development authentication stores.
+#
+# Production deployments should replace UserStore with persistent storage
+# and provide a stable RAGSHIELD_AUTH_SECRET.
+
+user_store = UserStore()
+
+token_manager = TokenManager()
+
+rbac = RBAC()
+
+
+def get_current_principal(
+    credentials: Optional[
+        HTTPAuthorizationCredentials
+    ] = Depends(bearer_scheme),
+) -> AuthenticatedPrincipal:
+    """
+    Authenticate the current API request.
+
+    Requires:
+
+        Authorization: Bearer <token>
+    """
+
+    if credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required.",
+            headers={
+                "WWW-Authenticate": "Bearer",
+            },
+        )
+
+    if credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=401,
+            detail="Bearer authentication required.",
+            headers={
+                "WWW-Authenticate": "Bearer",
+            },
+        )
+
+    try:
+        return token_manager.validate(
+            credentials.credentials
+        )
+
+    except (
+        AuthenticationError,
+        AuthorizationError,
+        TokenValidationError,
+        ValueError,
+    ) as exc:
+        logger.warning(
+            "Authentication failed: %s",
+            exc,
+        )
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired authentication token.",
+            headers={
+                "WWW-Authenticate": "Bearer",
+            },
+        )
+
+
+def require_permission(
+    permission: str,
+):
+    """
+    Create a FastAPI dependency requiring an RBAC permission.
+    """
+
+    def dependency(
+        principal: AuthenticatedPrincipal = Depends(
+            get_current_principal
+        ),
+    ) -> AuthenticatedPrincipal:
+
+        try:
+            rbac.require_permission(
+                principal,
+                permission,
+            )
+
+        except AuthorizationError as exc:
+            logger.warning(
+                "Authorization denied for %s: %s",
+                getattr(
+                    principal,
+                    "username",
+                    "unknown",
+                ),
+                exc,
+            )
+
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient permissions.",
+            )
+
+        return principal
+
+    return dependency
+
+
+def require_admin(
+    principal: AuthenticatedPrincipal = Depends(
+        get_current_principal
+    ),
+) -> AuthenticatedPrincipal:
+    """
+    Require the admin role for destructive administrative operations.
+    """
+
+    try:
+        rbac.require_role(
+            principal,
+            "admin",
+        )
+
+    except AuthorizationError as exc:
+        logger.warning(
+            "Admin authorization denied for %s: %s",
+            getattr(
+                principal,
+                "username",
+                "unknown",
+            ),
+            exc,
+        )
+
+        raise HTTPException(
+            status_code=403,
+            detail="Administrator privileges required.",
+        )
+
+    return principal
 
 
 # ============================================================================
@@ -807,6 +976,9 @@ def info():
 @app.post("/setup")
 def setup(
     request: SetupRequest,
+    principal: AuthenticatedPrincipal = Depends(
+        require_permission("manage_documents")
+    ),
 ):
     """
     Reset the vector database and optionally inject a poisoned document.
@@ -910,6 +1082,9 @@ def setup(
 )
 def attack(
     request: AttackRequest,
+    principal: AuthenticatedPrincipal = Depends(
+        require_permission("run_red_team")
+    ),
 ):
     """
     Analyze a poisoning payload.
@@ -1137,6 +1312,9 @@ def attack(
 )
 def query(
     request: QueryRequest,
+    principal: AuthenticatedPrincipal = Depends(
+        require_permission("query")
+    ),
 ):
     """
     Execute a protected RAG query.
@@ -1551,7 +1729,11 @@ def query(
     "/audit",
     response_model=AuditResponse,
 )
-def get_audit():
+def get_audit(
+    principal: AuthenticatedPrincipal = Depends(
+        require_permission("read_audit")
+    ),
+):
     """
     Return the persistent security audit trail.
 
@@ -1690,7 +1872,11 @@ def get_audit():
 # ============================================================================
 
 @app.delete("/audit")
-def clear_audit():
+def clear_audit(
+    principal: AuthenticatedPrincipal = Depends(
+        require_admin
+    ),
+):
     """
     Clear the persistent security audit trail.
     """
@@ -1748,6 +1934,10 @@ def startup_event():
 
     logger.info(
         "Persistent audit logging enabled."
+    )
+
+    logger.info(
+        "API authentication and RBAC enabled."
     )
 
     logger.info(
