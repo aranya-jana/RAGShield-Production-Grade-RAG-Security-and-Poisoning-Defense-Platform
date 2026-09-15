@@ -45,6 +45,11 @@ try:
 except ImportError:
     from document_provenance import DocumentProvenanceManager
 
+try:
+    from src.pii_detector import PIIDetector
+except ImportError:
+    from pii_detector import PIIDetector
+
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +135,14 @@ class RAGSystem:
         # metadata. Retrieved documents are verified before any other
         # document security detector can allow them into LLM context.
         self.provenance_manager = DocumentProvenanceManager()
+
+        # --------------------------------------------------------------
+        # PII / Secret Detection & DLP
+        # --------------------------------------------------------------
+        # The detector is deterministic and local. Ordinary PII such as
+        # email addresses and phone numbers is recorded as a DLP finding,
+        # while high-risk credentials/secrets are quarantined/blocked.
+        self.pii_detector = PIIDetector()
 
         # --------------------------------------------------------------
         # Contradiction detector
@@ -413,6 +426,81 @@ class RAGSystem:
             or metadata.get("ragshield_metadata_sha256")
         )
 
+    def _analyze_document_dlp(self, document):
+        """Scan document content and metadata for PII and secrets.
+
+        The detector receives both content and metadata so sensitive data
+        cannot evade DLP merely by being moved into document metadata.
+        The raw finding values are retained only inside the in-memory
+        detection result; audit telemetry uses masked values.
+        """
+        if not hasattr(self, "pii_detector"):
+            self.pii_detector = PIIDetector()
+
+        metadata = dict(getattr(document, "metadata", {}) or {})
+        content = getattr(document, "page_content", "") or ""
+
+        # Scan content and a conservative textual representation of metadata.
+        # Metadata is included for DLP visibility but is never trusted.
+        metadata_text = " ".join(
+            f"{key}: {value}" for key, value in metadata.items()
+            if not str(key).startswith("ragshield_")
+        )
+        combined_text = content
+        if metadata_text:
+            combined_text = f"{content}\n{metadata_text}"
+
+        return self.pii_detector.analyze(combined_text)
+
+    def _document_dlp_metadata(self, dlp_result) -> dict:
+        """Return masked DLP telemetry suitable for audit/UI use."""
+        if dlp_result is None:
+            return {
+                "has_pii": False,
+                "score": 0.0,
+                "finding_count": 0,
+                "categories": [],
+                "findings": [],
+            }
+
+        if not hasattr(self, "pii_detector"):
+            self.pii_detector = PIIDetector()
+
+        return {
+            "has_pii": bool(
+                getattr(dlp_result, "has_pii", False)
+            ),
+            "score": float(
+                getattr(dlp_result, "score", 0.0)
+            ),
+            "finding_count": int(
+                getattr(dlp_result, "finding_count", 0)
+            ),
+            "categories": list(
+                getattr(dlp_result, "categories", ()) or ()
+            ),
+            "findings": self.pii_detector.safe_audit_findings(
+                dlp_result
+            ),
+        }
+
+    @staticmethod
+    def _dlp_contains_high_risk_secret(dlp_result) -> bool:
+        """Return True for credential/secret categories requiring blocking."""
+        high_risk_categories = {
+            "credit_card",
+            "ssn",
+            "aws_access_key",
+            "github_token",
+            "private_key",
+            "jwt",
+            "generic_secret",
+        }
+        categories = set(
+            getattr(dlp_result, "categories", ()) or ()
+        )
+        return bool(categories.intersection(high_risk_categories))
+
     @staticmethod
     def _metadata_risk_score(document) -> float:
         """Detect instruction-like metadata without trusting document labels."""
@@ -518,8 +606,54 @@ class RAGSystem:
             # document record entering Chroma has an integrity identity.
             self._enrich_document_provenance(doc)
 
-            injection_detection = self._analyze_document_security(doc)
+            # DLP is evaluated before the document can become trusted RAG
+            # context. Ordinary PII is allowed for legitimate business data;
+            # high-risk credentials/secrets are quarantined.
+            dlp_detection = self._analyze_document_dlp(doc)
             source = doc.metadata.get("source", "unknown")
+
+            if getattr(dlp_detection, "has_pii", False):
+                dlp_metadata = self._document_dlp_metadata(dlp_detection)
+                dlp_blocked = self._dlp_contains_high_risk_secret(
+                    dlp_detection
+                )
+
+                self._write_audit_event(
+                    event_type=(
+                        "document_dlp_blocked"
+                        if dlp_blocked
+                        else "document_dlp_detected"
+                    ),
+                    source=source,
+                    document_type=doc.metadata.get(
+                        "type",
+                        doc.metadata.get("document_type", "unknown"),
+                    ),
+                    detector="PIIDetector",
+                    score=float(
+                        getattr(dlp_detection, "score", 0.0)
+                    ),
+                    status="QUARANTINED" if dlp_blocked else "DETECTED",
+                    reasons=list(
+                        getattr(dlp_detection, "reasons", ()) or ()
+                    ),
+                    metadata={
+                        "stage": "ingestion",
+                        "dlp": dlp_metadata,
+                        "trusted": not dlp_blocked,
+                    },
+                )
+
+                if dlp_blocked:
+                    quarantined_docs.append(doc)
+                    logger.warning(
+                        "DOCUMENT DLP QUARANTINED: %s | categories=%s",
+                        source,
+                        dlp_metadata["categories"],
+                    )
+                    continue
+
+            injection_detection = self._analyze_document_security(doc)
 
             risk_assessment = self._assess_document_risk(
                 injection_score=float(
@@ -643,6 +777,49 @@ class RAGSystem:
             # provenance so retrieval can demonstrate independent integrity
             # verification before the poison detector runs.
             self._enrich_document_provenance(poisoned_doc)
+
+            # DLP scan is independent from poisoning/injection analysis.
+            # This keeps credential exposure visible even when another
+            # detector is already expected to block the document.
+            poisoned_dlp_detection = self._analyze_document_dlp(
+                poisoned_doc
+            )
+            if getattr(poisoned_dlp_detection, "has_pii", False):
+                self._write_audit_event(
+                    event_type="document_dlp_detected",
+                    source=poisoned_doc.metadata.get(
+                        "source", "unknown"
+                    ),
+                    document_type=poisoned_doc.metadata.get(
+                        "type",
+                        poisoned_doc.metadata.get(
+                            "document_type", "unknown"
+                        ),
+                    ),
+                    detector="PIIDetector",
+                    score=float(
+                        getattr(
+                            poisoned_dlp_detection,
+                            "score",
+                            0.0,
+                        )
+                    ),
+                    status="DETECTED",
+                    reasons=list(
+                        getattr(
+                            poisoned_dlp_detection,
+                            "reasons",
+                            (),
+                        ) or []
+                    ),
+                    metadata={
+                        "stage": "ingestion",
+                        "dlp": self._document_dlp_metadata(
+                            poisoned_dlp_detection
+                        ),
+                        "trusted": False,
+                    },
+                )
 
             # ----------------------------------------------------------
             # PoisonDetector
@@ -1266,6 +1443,113 @@ class RAGSystem:
                     },
                 )
 
+            # ----------------------------------------------------------
+            # PII / Secret DLP detection
+            # ----------------------------------------------------------
+            dlp_detection = self._analyze_document_dlp(doc)
+
+            if getattr(dlp_detection, "has_pii", False):
+                dlp_metadata = self._document_dlp_metadata(dlp_detection)
+                dlp_blocked = self._dlp_contains_high_risk_secret(
+                    dlp_detection
+                )
+
+                if dlp_blocked:
+                    blocked_documents.append(doc)
+
+                    dlp_event = {
+                        "source": source,
+                        "document_type": document_type,
+                        "detector": "PIIDetector",
+                        "score": float(
+                            getattr(dlp_detection, "score", 0.0)
+                        ),
+                        "is_poisoned": False,
+                        "is_contradictory": False,
+                        "is_injected": False,
+                        "is_pii": True,
+                        "dlp": dlp_metadata,
+                        "reasons": list(
+                            getattr(
+                                dlp_detection,
+                                "reasons",
+                                (),
+                            ) or []
+                        ),
+                        "risk_score": 100.0,
+                        "trust_score": 0.0,
+                        "classification": "BLOCKED",
+                        "status": "BLOCKED",
+                        "provenance": self._document_provenance_metadata(
+                            doc, provenance_verification
+                        ),
+                    }
+                    security_events.append(dlp_event)
+
+                    self._write_audit_event(
+                        event_type="document_dlp_blocked",
+                        query=query_text,
+                        source=source,
+                        document_type=document_type,
+                        detector="PIIDetector",
+                        score=float(
+                            getattr(dlp_detection, "score", 0.0)
+                        ),
+                        status="BLOCKED",
+                        reasons=list(
+                            getattr(
+                                dlp_detection,
+                                "reasons",
+                                (),
+                            ) or []
+                        ),
+                        metadata={
+                            "stage": "retrieval",
+                            "reason": "high_risk_secret",
+                            "dlp": dlp_metadata,
+                            "risk_score": 100.0,
+                            "trust_score": 0.0,
+                            "classification": "BLOCKED",
+                        },
+                    )
+
+                    logger.warning(
+                        "DOCUMENT DLP BLOCKED: %s | categories=%s",
+                        source,
+                        dlp_metadata["categories"],
+                    )
+                    print(
+                        f"BLOCKED document DLP secret: {source}"
+                    )
+                    continue
+
+                # Ordinary PII is not automatically blocked. Keep it visible
+                # to the security layer and audit trail, but do not place raw
+                # finding values in telemetry.
+                self._write_audit_event(
+                    event_type="document_dlp_detected",
+                    query=query_text,
+                    source=source,
+                    document_type=document_type,
+                    detector="PIIDetector",
+                    score=float(
+                        getattr(dlp_detection, "score", 0.0)
+                    ),
+                    status="DETECTED",
+                    reasons=list(
+                        getattr(
+                            dlp_detection,
+                            "reasons",
+                            (),
+                        ) or []
+                    ),
+                    metadata={
+                        "stage": "retrieval",
+                        "dlp": dlp_metadata,
+                        "reason": "ordinary_pii",
+                    },
+                )
+
             metadata_score = self._metadata_risk_score(doc)
 
             # ----------------------------------------------------------
@@ -1552,8 +1836,16 @@ class RAGSystem:
             safe_event = {
                 "source": source,
                 "document_type": document_type,
-                "detector": "None",
-                "score": 0.0,
+                "detector": (
+                    "PIIDetector"
+                    if getattr(dlp_detection, "has_pii", False)
+                    else "None"
+                ),
+                "score": (
+                    float(getattr(dlp_detection, "score", 0.0))
+                    if getattr(dlp_detection, "has_pii", False)
+                    else 0.0
+                ),
                 "is_poisoned": False,
                 "is_contradictory": False,
                 "is_injected": False,
@@ -1562,6 +1854,10 @@ class RAGSystem:
                 "trust_score": safe_risk.trust_score,
                 "classification": safe_risk.classification,
                 "status": "SAFE",
+                "is_pii": bool(
+                    getattr(dlp_detection, "has_pii", False)
+                ),
+                "dlp": self._document_dlp_metadata(dlp_detection),
             }
 
             security_events.append(
