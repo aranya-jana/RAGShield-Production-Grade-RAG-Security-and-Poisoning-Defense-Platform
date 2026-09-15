@@ -51,6 +51,25 @@ except ImportError:
     from pii_detector import PIIDetector
 
 
+class OutputDLPResult:
+    """Result of scanning an LLM-generated response for sensitive data."""
+
+    def __init__(self, original_text, action, redacted_text, detection):
+        self.original_text = original_text
+        self.action = action
+        self.redacted_text = redacted_text
+        self.detection = detection
+
+    @property
+    def blocked(self):
+        return self.action == "BLOCKED"
+
+    @property
+    def redacted(self):
+        return self.action == "REDACTED"
+
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -143,6 +162,15 @@ class RAGSystem:
         # email addresses and phone numbers is recorded as a DLP finding,
         # while high-risk credentials/secrets are quarantined/blocked.
         self.pii_detector = PIIDetector()
+        self.output_dlp_redact_categories = {
+            "credit_card",
+            "ssn",
+            "aws_access_key",
+            "github_token",
+            "private_key",
+            "jwt",
+            "generic_secret",
+        }
 
         # --------------------------------------------------------------
         # Contradiction detector
@@ -425,6 +453,54 @@ class RAGSystem:
             metadata.get("ragshield_content_sha256")
             or metadata.get("ragshield_metadata_sha256")
         )
+
+    def _analyze_output_dlp(self, response_text):
+        """Scan generated LLM output and enforce the configured DLP policy."""
+        if not hasattr(self, "pii_detector") or self.pii_detector is None:
+            self.pii_detector = PIIDetector()
+
+        text = "" if response_text is None else str(response_text)
+        detection = self.pii_detector.analyze(text)
+
+        if not detection.has_pii:
+            return OutputDLPResult(text, "ALLOWED", text, detection)
+
+        high_risk = [
+            finding
+            for finding in detection.findings
+            if finding.category in self.output_dlp_redact_categories
+        ]
+
+        if high_risk:
+            redacted = self.pii_detector.redact_findings(text, detection)
+            return OutputDLPResult(text, "REDACTED", redacted, detection)
+
+        return OutputDLPResult(text, "ALLOWED", text, detection)
+
+    def _output_dlp_metadata(self, result):
+        """Return output-DLP telemetry without exposing raw sensitive values."""
+        if result is None:
+            return {
+                "action": "ALLOWED",
+                "has_pii": False,
+                "score": 0.0,
+                "finding_count": 0,
+                "categories": [],
+                "findings": [],
+            }
+
+        if not hasattr(self, "pii_detector") or self.pii_detector is None:
+            self.pii_detector = PIIDetector()
+
+        detection = result.detection
+        return {
+            "action": str(result.action),
+            "has_pii": bool(getattr(detection, "has_pii", False)),
+            "score": float(getattr(detection, "score", 0.0)),
+            "finding_count": int(getattr(detection, "finding_count", 0)),
+            "categories": list(getattr(detection, "categories", ()) or ()),
+            "findings": self.pii_detector.safe_audit_findings(detection),
+        }
 
     def _analyze_document_dlp(self, document):
         """Scan document content and metadata for PII and secrets.
@@ -1985,6 +2061,46 @@ class RAGSystem:
         else:
 
             answer = str(response)
+
+        # --------------------------------------------------------------
+        # Final DLP gate
+        # --------------------------------------------------------------
+
+        output_dlp = self._analyze_output_dlp(answer)
+
+        if output_dlp.redacted:
+            output_dlp_details = self._output_dlp_metadata(output_dlp)
+
+            self.security_events.append(
+                {
+                    "type": "OutputDLP",
+                    "detector": "PIIDetector",
+                    "severity": "HIGH",
+                    "risk_score": 100,
+                    "classification": "REDACTED",
+                    "reason": (
+                        "High-risk sensitive data detected in LLM output"
+                    ),
+                    "dlp": output_dlp_details,
+                }
+            )
+
+            self._write_audit_event(
+                event_type="output_dlp_redacted",
+                query=query_text,
+                status="REDACTED",
+                metadata=output_dlp_details,
+            )
+
+            answer = output_dlp.redacted_text
+
+        elif output_dlp.detection.has_pii:
+            self._write_audit_event(
+                event_type="output_dlp_detected",
+                query=query_text,
+                status="DETECTED",
+                metadata=self._output_dlp_metadata(output_dlp),
+            )
 
         # --------------------------------------------------------------
         # Audit successful protected query
