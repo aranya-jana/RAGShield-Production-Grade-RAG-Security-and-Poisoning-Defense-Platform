@@ -34,6 +34,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from src.security_middleware import SecurityHeadersMiddleware
+from src.security_telemetry import (
+    get_request_id,
+    safe_content_metadata,
+    security_event_metadata,
+)
 
 try:
     from src.rate_limiter import RateLimiter
@@ -178,6 +183,17 @@ def get_current_principal(
     """
 
     if credentials is None:
+        add_audit_event(
+            event_type="AUTHENTICATION FAILURE",
+            status="BLOCKED",
+            detector="Authentication",
+            reasons=["Authentication credentials missing."],
+            telemetry_metadata=security_event_metadata(
+                category="authentication",
+                reason_code="missing_credentials",
+                severity="WARNING",
+            ),
+        )
         raise HTTPException(
             status_code=401,
             detail="Authentication required.",
@@ -187,6 +203,17 @@ def get_current_principal(
         )
 
     if credentials.scheme.lower() != "bearer":
+        add_audit_event(
+            event_type="AUTHENTICATION FAILURE",
+            status="BLOCKED",
+            detector="Authentication",
+            reasons=["Unsupported authentication scheme."],
+            telemetry_metadata=security_event_metadata(
+                category="authentication",
+                reason_code="unsupported_scheme",
+                severity="WARNING",
+            ),
+        )
         raise HTTPException(
             status_code=401,
             detail="Bearer authentication required.",
@@ -209,6 +236,18 @@ def get_current_principal(
         logger.warning(
             "Authentication failed: %s",
             exc,
+        )
+
+        add_audit_event(
+            event_type="AUTHENTICATION FAILURE",
+            status="BLOCKED",
+            detector="Authentication",
+            reasons=["Authentication token rejected."],
+            telemetry_metadata=security_event_metadata(
+                category="authentication",
+                reason_code="invalid_token",
+                severity="WARNING",
+            ),
         )
 
         raise HTTPException(
@@ -240,14 +279,30 @@ def require_permission(
             )
 
         except AuthorizationError as exc:
+            username = getattr(
+                principal,
+                "username",
+                "unknown",
+            )
+
             logger.warning(
                 "Authorization denied for %s: %s",
-                getattr(
-                    principal,
-                    "username",
-                    "unknown",
-                ),
+                username,
                 exc,
+            )
+
+            add_audit_event(
+                event_type="AUTHORIZATION FAILURE",
+                status="BLOCKED",
+                detector="RBAC",
+                reasons=["Required permission denied."],
+                telemetry_metadata=security_event_metadata(
+                    category="authorization",
+                    reason_code="permission_denied",
+                    severity="WARNING",
+                    username=username,
+                    permission=permission,
+                ),
             )
 
             raise HTTPException(
@@ -276,14 +331,30 @@ def require_admin(
         )
 
     except AuthorizationError as exc:
+        username = getattr(
+            principal,
+            "username",
+            "unknown",
+        )
+
         logger.warning(
             "Admin authorization denied for %s: %s",
-            getattr(
-                principal,
-                "username",
-                "unknown",
-            ),
+            username,
             exc,
+        )
+
+        add_audit_event(
+            event_type="AUTHORIZATION FAILURE",
+            status="BLOCKED",
+            detector="RBAC",
+            reasons=["Administrator role required."],
+            telemetry_metadata=security_event_metadata(
+                category="authorization",
+                reason_code="admin_role_denied",
+                severity="HIGH",
+                username=username,
+                permission="admin",
+            ),
         )
 
         raise HTTPException(
@@ -348,6 +419,23 @@ def enforce_rate_limit(
                 "Rate limit exceeded: scope=%s user=%s",
                 scope,
                 username,
+            )
+
+            add_audit_event(
+                event_type="RATE LIMIT VIOLATION",
+                status="BLOCKED",
+                detector="RateLimiter",
+                reasons=["Endpoint rate limit exceeded."],
+                telemetry_metadata=security_event_metadata(
+                    category="rate_limit",
+                    reason_code="limit_exceeded",
+                    severity="HIGH",
+                    username=username,
+                    scope=scope,
+                    limit=decision.limit,
+                    remaining=decision.remaining,
+                    retry_after_seconds=decision.retry_after_seconds,
+                ),
             )
 
             raise HTTPException(
@@ -590,6 +678,18 @@ class AuditEvent(BaseModel):
 
     reasons: List[str] = []
 
+    request_id: Optional[str] = None
+
+    username: Optional[str] = None
+
+    category: Optional[str] = None
+
+    reason_code: Optional[str] = None
+
+    severity: Optional[str] = None
+
+    endpoint: Optional[str] = None
+
 
 class AuditResponse(BaseModel):
     """Audit log response."""
@@ -735,31 +835,49 @@ def add_audit_event(
     detector: Optional[str] = None,
     score: float = 0.0,
     reasons: Optional[List[str]] = None,
+    telemetry_metadata: Optional[dict] = None,
 ) -> dict:
     """
     Write an event to the persistent security audit log.
 
-    SecurityAuditLogger is the single source of truth.
+    Raw request contents are never persisted by API telemetry.
 
-    The API keeps payload information in metadata because the shared
-    SecurityAuditLogger schema does not have a dedicated payload field.
+    When ``query`` or ``payload`` is supplied, only:
+        - SHA-256 content digest
+        - content length
+
+    are retained in the ``request_content`` metadata.
+
+    Structured telemetry metadata is merged into the same event.
     """
 
-    metadata = None
+    metadata = {
+        "api_event": True,
+    }
+
+    request_content = None
 
     if payload is not None:
-        metadata = {
-            "payload": payload,
-            "api_event": True,
-        }
-    else:
-        metadata = {
-            "api_event": True,
-        }
+        request_content = safe_content_metadata(payload)
+    elif query is not None:
+        request_content = safe_content_metadata(query)
+
+    if request_content is not None:
+        metadata["request_content"] = request_content
+
+    if telemetry_metadata:
+        metadata.update(
+            telemetry_metadata
+        )
+
+    request_id = get_request_id()
+
+    if request_id:
+        metadata["request_id"] = request_id
 
     event = audit_logger.log_event(
         event_type=event_type,
-        query=query,
+        query=None,
         source=source,
         detector=detector,
         score=float(score),
@@ -767,12 +885,6 @@ def add_audit_event(
         reasons=reasons or [],
         metadata=metadata,
     )
-
-    # SecurityAuditLogger returns its own event dictionary.
-    #
-    # The frontend AuditEvent model expects event_id.
-    # The current shared logger does not necessarily generate one,
-    # so ensure one exists here.
 
     if not event.get("event_id"):
         event["event_id"] = str(
@@ -1084,7 +1196,7 @@ def info():
 
         raise HTTPException(
             status_code=500,
-            detail=str(exc),
+            detail="Internal server error.",
         )
 
 
@@ -1190,7 +1302,7 @@ def setup(
 
         raise HTTPException(
             status_code=500,
-            detail=str(exc),
+            detail="Internal server error.",
         )
 
 
@@ -1423,7 +1535,7 @@ def attack(
 
         raise HTTPException(
             status_code=500,
-            detail=str(exc),
+            detail="Internal server error.",
         )
 
 
@@ -1845,7 +1957,7 @@ def query(
 
         raise HTTPException(
             status_code=500,
-            detail=str(exc),
+            detail="Internal server error.",
         )
 
 
@@ -1974,6 +2086,30 @@ def get_audit(
                         )
                         or []
                     ),
+
+                    request_id=metadata.get(
+                        "request_id"
+                    ),
+
+                    username=metadata.get(
+                        "username"
+                    ),
+
+                    category=metadata.get(
+                        "category"
+                    ),
+
+                    reason_code=metadata.get(
+                        "reason_code"
+                    ),
+
+                    severity=metadata.get(
+                        "severity"
+                    ),
+
+                    endpoint=metadata.get(
+                        "path"
+                    ),
                 )
             )
 
@@ -1991,7 +2127,7 @@ def get_audit(
 
         raise HTTPException(
             status_code=500,
-            detail=str(exc),
+            detail="Internal server error.",
         )
 
 
@@ -2036,7 +2172,7 @@ def clear_audit(
 
         raise HTTPException(
             status_code=500,
-            detail=str(exc),
+            detail="Internal server error.",
         )
 
 
