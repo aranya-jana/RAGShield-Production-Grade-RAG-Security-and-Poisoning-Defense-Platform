@@ -10,6 +10,7 @@ Includes:
 - poisoned-document blocking
 - security telemetry
 - persistent security audit logging
+- document provenance and retrieval-time integrity verification
 """
 
 import logging
@@ -38,6 +39,11 @@ try:
     from src.prompt_injection_detector import PromptInjectionDetector
 except ImportError:
     from prompt_injection_detector import PromptInjectionDetector
+
+try:
+    from src.document_provenance import DocumentProvenanceManager
+except ImportError:
+    from document_provenance import DocumentProvenanceManager
 
 
 logger = logging.getLogger(__name__)
@@ -116,6 +122,14 @@ class RAGSystem:
         # Blocking behavior is intentionally added in a later integration
         # step after the detector itself has been validated.
         self.prompt_injection_detector = PromptInjectionDetector()
+
+        # --------------------------------------------------------------
+        # Document provenance and integrity
+        # --------------------------------------------------------------
+        # Every newly ingested document receives deterministic provenance
+        # metadata. Retrieved documents are verified before any other
+        # document security detector can allow them into LLM context.
+        self.provenance_manager = DocumentProvenanceManager()
 
         # --------------------------------------------------------------
         # Contradiction detector
@@ -349,6 +363,56 @@ class RAGSystem:
             metadata_score=metadata_score,
         )
 
+    def _enrich_document_provenance(self, document):
+        """Attach RAGShield provenance metadata to a document."""
+        if not hasattr(self, "provenance_manager"):
+            self.provenance_manager = DocumentProvenanceManager()
+
+        return self.provenance_manager.enrich_document(document)
+
+    def _verify_document_provenance(self, document):
+        """Verify a document against its stored provenance hashes."""
+        if not hasattr(self, "provenance_manager"):
+            self.provenance_manager = DocumentProvenanceManager()
+
+        return self.provenance_manager.verify_document(document)
+
+    @staticmethod
+    def _document_provenance_metadata(document, verification=None) -> dict:
+        """Return compact provenance telemetry for audit/security events."""
+        metadata = dict(getattr(document, "metadata", {}) or {})
+
+        provenance = {
+            "document_id": metadata.get("ragshield_document_id"),
+            "provenance_source": metadata.get("ragshield_source"),
+            "ingested_at": metadata.get("ragshield_ingested_at"),
+            "content_sha256": metadata.get("ragshield_content_sha256"),
+            "metadata_sha256": metadata.get("ragshield_metadata_sha256"),
+            "provenance_version": metadata.get("ragshield_provenance_version"),
+        }
+
+        if verification is not None:
+            provenance.update({
+                "provenance_valid": bool(verification.is_valid),
+                "content_hash_valid": bool(verification.content_hash_valid),
+                "metadata_hash_valid": bool(verification.metadata_hash_valid),
+                "expected_content_sha256": verification.expected_content_sha256,
+                "actual_content_sha256": verification.actual_content_sha256,
+                "expected_metadata_sha256": verification.expected_metadata_sha256,
+                "actual_metadata_sha256": verification.actual_metadata_sha256,
+            })
+
+        return provenance
+
+    @staticmethod
+    def _has_document_provenance(document) -> bool:
+        """Return True when a document carries RAGShield provenance hashes."""
+        metadata = dict(getattr(document, "metadata", {}) or {})
+        return bool(
+            metadata.get("ragshield_content_sha256")
+            or metadata.get("ragshield_metadata_sha256")
+        )
+
     @staticmethod
     def _metadata_risk_score(document) -> float:
         """Detect instruction-like metadata without trusting document labels."""
@@ -450,6 +514,10 @@ class RAGSystem:
         quarantined_docs = []
 
         for doc in benign_docs:
+            # Provenance is created before security analysis so the complete
+            # document record entering Chroma has an integrity identity.
+            self._enrich_document_provenance(doc)
+
             injection_detection = self._analyze_document_security(doc)
             source = doc.metadata.get("source", "unknown")
 
@@ -570,6 +638,11 @@ class RAGSystem:
             poisoned_doc = create_poisoned_document(
                 payload=payload
             )
+
+            # The intentionally poisoned POC document also receives
+            # provenance so retrieval can demonstrate independent integrity
+            # verification before the poison detector runs.
+            self._enrich_document_provenance(poisoned_doc)
 
             # ----------------------------------------------------------
             # PoisonDetector
@@ -1110,6 +1183,89 @@ class RAGSystem:
                 ),
             )
 
+            # ----------------------------------------------------------
+            # Document provenance / integrity verification
+            # ----------------------------------------------------------
+            # Integrity is checked immediately after retrieval and before
+            # prompt-injection, poisoning, contradiction, or LLM processing.
+            # Legacy documents without provenance are allowed temporarily for
+            # backward compatibility with pre-provenance Chroma collections.
+            provenance_verification = self._verify_document_provenance(doc)
+            has_provenance = self._has_document_provenance(doc)
+
+            if has_provenance and not provenance_verification.is_valid:
+                blocked_documents.append(doc)
+
+                provenance_event = {
+                    "source": source,
+                    "document_type": document_type,
+                    "detector": "DocumentProvenanceIntegrity",
+                    "score": 1.0,
+                    "is_poisoned": False,
+                    "is_contradictory": False,
+                    "is_injected": False,
+                    "reasons": list(provenance_verification.reasons),
+                    "risk_score": 100.0,
+                    "trust_score": 0.0,
+                    "classification": "BLOCKED",
+                    "status": "BLOCKED",
+                    "provenance": self._document_provenance_metadata(
+                        doc, provenance_verification
+                    ),
+                }
+
+                security_events.append(provenance_event)
+
+                self._write_audit_event(
+                    event_type="document_integrity_violation",
+                    query=query_text,
+                    source=source,
+                    document_type=document_type,
+                    detector="DocumentProvenanceIntegrity",
+                    score=1.0,
+                    status="BLOCKED",
+                    reasons=list(provenance_verification.reasons),
+                    metadata={
+                        "stage": "retrieval",
+                        "reason": "provenance_integrity_mismatch",
+                        **self._document_provenance_metadata(
+                            doc, provenance_verification
+                        ),
+                    },
+                )
+
+                logger.warning(
+                    "DOCUMENT INTEGRITY VIOLATION BLOCKED: %s | "
+                    "reasons=%s",
+                    source,
+                    list(provenance_verification.reasons),
+                )
+
+                print(
+                    f"BLOCKED document integrity violation: {source}"
+                )
+
+                continue
+
+            if not has_provenance:
+                self._write_audit_event(
+                    event_type="document_provenance_missing",
+                    query=query_text,
+                    source=source,
+                    document_type=document_type,
+                    detector="DocumentProvenanceIntegrity",
+                    score=0.0,
+                    status="LEGACY",
+                    reasons=[
+                        "Document has no RAGShield provenance metadata; "
+                        "legacy compatibility mode allowed retrieval."
+                    ],
+                    metadata={
+                        "stage": "retrieval",
+                        "provenance_required": False,
+                    },
+                )
+
             metadata_score = self._metadata_risk_score(doc)
 
             # ----------------------------------------------------------
@@ -1162,6 +1318,9 @@ class RAGSystem:
                     "trust_score": injection_risk.trust_score,
                     "classification": injection_risk.classification,
                     "status": "BLOCKED",
+                    "provenance": self._document_provenance_metadata(
+                        doc, provenance_verification
+                    ),
                 }
 
                 security_events.append(event)
@@ -1236,6 +1395,9 @@ class RAGSystem:
                     "trust_score": poison_risk.trust_score,
                     "classification": poison_risk.classification,
                     "status": "BLOCKED",
+                    "provenance": self._document_provenance_metadata(
+                        doc, provenance_verification
+                    ),
                 }
 
                 security_events.append(
@@ -1323,6 +1485,9 @@ class RAGSystem:
                     "trust_score": contradiction_risk.trust_score,
                     "classification": contradiction_risk.classification,
                     "status": "BLOCKED",
+                    "provenance": self._document_provenance_metadata(
+                        doc, provenance_verification
+                    ),
                 }
 
                 security_events.append(
@@ -1418,6 +1583,9 @@ class RAGSystem:
                     "risk_score": safe_risk.risk_score,
                     "trust_score": safe_risk.trust_score,
                     "classification": safe_risk.classification,
+                    **self._document_provenance_metadata(
+                        doc, provenance_verification
+                    ),
                 },
             )
 
@@ -1542,6 +1710,7 @@ class RAGSystem:
                 ),
                 "llm_called": True,
                 "risk_engine": "RiskTrustEngine",
+                "provenance_integrity": "verified_for_provenance_documents",
             },
         )
 
