@@ -29,6 +29,7 @@ import time
 import uuid
 from typing import List, Optional
 
+from src.request_size_limit import RequestSizeLimitMiddleware
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
@@ -118,6 +119,15 @@ app.add_middleware(
     SecurityHeadersMiddleware,
 )
 
+app.add_middleware(
+    RequestSizeLimitMiddleware,
+    max_body_bytes=5 * 1024 * 1024,
+    path_limits={
+        "/query": 64 * 1024,
+        "/attack": 256 * 1024,
+        "/setup": 5 * 1024 * 1024,
+    },
+)
 
 # ============================================================================
 # AUTHENTICATION / RBAC
