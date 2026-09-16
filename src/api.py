@@ -904,6 +904,35 @@ def add_audit_event(
     return event
 
 
+def record_internal_error(
+    *,
+    endpoint: str,
+    reason_code: str = "internal_server_error",
+) -> None:
+    """
+    Record an unexpected API exception without persisting exception details.
+
+    Detailed exception information remains available through the server-side
+    logger.exception() call in the endpoint handler. Persistent security
+    telemetry stores only safe correlation and classification metadata.
+    """
+
+    add_audit_event(
+        event_type="INTERNAL SERVER ERROR",
+        status="ERROR",
+        detector="API",
+        reasons=["Unexpected internal server error."],
+        telemetry_metadata={
+            **security_event_metadata(
+                category="application_error",
+                reason_code=reason_code,
+                severity="HIGH",
+            ),
+            "endpoint": endpoint,
+        },
+    )
+
+
 def build_security_events(
     result: dict,
 ) -> List[SecurityEvent]:
@@ -1204,6 +1233,11 @@ def info():
             "Unable to load API information."
         )
 
+        record_internal_error(
+            endpoint="/info",
+            reason_code="info_internal_error",
+        )
+
         raise HTTPException(
             status_code=500,
             detail="Internal server error.",
@@ -1308,6 +1342,11 @@ def setup(
 
         logger.exception(
             "Setup failed."
+        )
+
+        record_internal_error(
+            endpoint="/setup",
+            reason_code="setup_internal_error",
         )
 
         raise HTTPException(
@@ -1543,6 +1582,11 @@ def attack(
             "Attack analysis failed."
         )
 
+        record_internal_error(
+            endpoint="/attack",
+            reason_code="attack_internal_error",
+        )
+
         raise HTTPException(
             status_code=500,
             detail="Internal server error.",
@@ -1592,9 +1636,9 @@ def query(
             )
 
         logger.info(
-            "Protected query: %s",
-            query_text,
-        )
+        "Protected query received. length=%d",
+        len(query_text),
+    )
 
         # --------------------------------------------------------------
         # Execute protected RAG
@@ -1965,6 +2009,11 @@ def query(
             "Query failed."
         )
 
+        record_internal_error(
+            endpoint="/query",
+            reason_code="query_internal_error",
+        )
+
         raise HTTPException(
             status_code=500,
             detail="Internal server error.",
@@ -2135,6 +2184,11 @@ def get_audit(
             "Unable to read audit log."
         )
 
+        record_internal_error(
+            endpoint="/audit",
+            reason_code="audit_read_internal_error",
+        )
+
         raise HTTPException(
             status_code=500,
             detail="Internal server error.",
@@ -2178,6 +2232,11 @@ def clear_audit(
 
         logger.exception(
             "Unable to clear audit log."
+        )
+
+        record_internal_error(
+            endpoint="/audit",
+            reason_code="audit_clear_internal_error",
         )
 
         raise HTTPException(
