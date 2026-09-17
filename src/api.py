@@ -6,7 +6,10 @@ Provides:
 GET     /
 GET     /health
 GET     /info
+POST    /auth/login
 POST    /setup
+POST    /documents/upload
+GET     /documents
 POST    /attack
 POST    /query
 GET     /audit
@@ -25,12 +28,14 @@ Audit architecture:
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
+from pathlib import Path
 from typing import List, Optional
 
 from src.request_size_limit import RequestSizeLimitMiddleware
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -69,6 +74,7 @@ try:
     )
     from src.rag_system import RAGSystem
     from src.audit_logger import SecurityAuditLogger
+    from src.document_ingestion import SecureDocumentIngestionService
     from src.auth import (
         AuthenticatedPrincipal,
         AuthenticationError,
@@ -87,6 +93,7 @@ except ImportError:
     )
     from rag_system import RAGSystem
     from audit_logger import SecurityAuditLogger
+    from document_ingestion import SecureDocumentIngestionService
     from auth import (
         AuthenticatedPrincipal,
         AuthenticationError,
@@ -126,6 +133,7 @@ app.add_middleware(
         "/query": 64 * 1024,
         "/attack": 256 * 1024,
         "/setup": 5 * 1024 * 1024,
+        "/documents/upload": 5 * 1024 * 1024,
     },
 )
 
@@ -174,6 +182,10 @@ RATE_LIMITS = {
     },
     "setup": {
         "limit": 5,
+        "window_seconds": 60,
+    },
+    "document_upload": {
+        "limit": 10,
         "window_seconds": 60,
     },
 }
@@ -505,6 +517,10 @@ app.add_middleware(
 
 rag_system: Optional[RAGSystem] = None
 
+# Secure document ingestion registry/service. Uploaded content is scanned
+# before it is ever added to the vector store.
+document_ingestion_service = SecureDocumentIngestionService()
+
 
 # ============================================================================
 # PERSISTENT AUDIT STORAGE
@@ -540,6 +556,34 @@ audit_logger = SecurityAuditLogger(
 # ============================================================================
 # REQUEST MODELS
 # ============================================================================
+
+class LoginRequest(BaseModel):
+    """Request body for API authentication."""
+
+    username: str = Field(
+        ...,
+        min_length=1,
+        max_length=128,
+        description="RAGShield username.",
+    )
+
+    password: str = Field(
+        ...,
+        min_length=1,
+        max_length=256,
+        description="RAGShield password.",
+    )
+
+
+class LoginResponse(BaseModel):
+    """Successful authentication response."""
+
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int
+    username: str
+    roles: List[str]
+
 
 class SetupRequest(BaseModel):
     """Request body for corpus setup."""
@@ -663,6 +707,64 @@ class AttackResponse(BaseModel):
     blocked_by: List[str]
 
     reasons: List[str]
+
+
+class DocumentUploadResponse(BaseModel):
+    """Security decision for one uploaded document."""
+
+    document_id: str
+    source: str
+    status: str
+    indexed: bool
+    quarantined: bool
+    size_bytes: int
+    content_sha256: str
+    provenance_version: str
+    poison_score: float
+    poison_detected: bool
+    contradiction_score: float
+    contradiction_detected: bool
+    injection_score: float
+    injection_detected: bool
+    dlp: dict
+    risk_score: float
+    trust_score: float
+    classification: str
+    detectors: List[str]
+    reasons: List[str]
+    content_preview: str
+
+
+class DocumentRegistryResponse(BaseModel):
+    """Non-sensitive document inventory record."""
+
+    document_id: str
+    source: str
+    extension: str
+    size_bytes: int
+    status: str
+    uploaded_at: str
+    content_sha256: str
+    metadata_sha256: str
+    provenance_version: str
+    poison_score: float
+    poison_detected: bool
+    contradiction_score: float
+    contradiction_detected: bool
+    injection_score: float
+    injection_detected: bool
+    dlp_score: float
+    dlp_detected: bool
+    risk_score: float
+    trust_score: float
+    classification: str
+    detectors: List[str]
+    reasons: List[str]
+
+
+class DocumentListResponse(BaseModel):
+    total: int
+    documents: List[DocumentRegistryResponse]
 
 
 class AuditEvent(BaseModel):
@@ -909,28 +1011,26 @@ def record_internal_error(
     endpoint: str,
     reason_code: str = "internal_server_error",
 ) -> None:
-    """
-    Record an unexpected API exception without persisting exception details.
+    """Record an unexpected API exception using safe telemetry only."""
 
-    Detailed exception information remains available through the server-side
-    logger.exception() call in the endpoint handler. Persistent security
-    telemetry stores only safe correlation and classification metadata.
-    """
+    try:
+        telemetry = security_event_metadata(
+            category="application_error",
+            reason_code=reason_code,
+            severity="HIGH",
+        )
+        telemetry["endpoint"] = endpoint
 
-    add_audit_event(
-        event_type="INTERNAL SERVER ERROR",
-        status="ERROR",
-        detector="API",
-        reasons=["Unexpected internal server error."],
-        telemetry_metadata={
-            **security_event_metadata(
-                category="application_error",
-                reason_code=reason_code,
-                severity="HIGH",
-            ),
-            "endpoint": endpoint,
-        },
-    )
+        add_audit_event(
+            event_type="INTERNAL SERVER ERROR",
+            status="ERROR",
+            detector="API",
+            reasons=["Unexpected internal server error."],
+            telemetry_metadata=telemetry,
+        )
+    except Exception:
+        # Error telemetry must never replace the original HTTP 500 response.
+        logger.exception("Unable to record internal error telemetry.")
 
 
 def build_security_events(
@@ -1196,6 +1296,106 @@ def health():
 
 
 # ============================================================================
+# AUTHENTICATION
+# ============================================================================
+
+@app.post(
+    "/auth/login",
+    response_model=LoginResponse,
+)
+def login(request: LoginRequest):
+    """Authenticate a user and issue a signed RAGShield bearer token."""
+
+    try:
+        user = user_store.authenticate(
+            username=request.username,
+            password=request.password,
+        )
+
+        if user.disabled:
+            add_audit_event(
+                event_type="AUTHENTICATION FAILURE",
+                status="BLOCKED",
+                detector="Authentication",
+                reasons=["Account is disabled."],
+                telemetry_metadata={
+                    **security_event_metadata(
+                        category="authentication",
+                        reason_code="disabled_account",
+                        severity="HIGH",
+                        username=request.username,
+                    ),
+                    "endpoint": "/auth/login",
+                },
+            )
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid username or password.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        token = token_manager.issue(user)
+
+        add_audit_event(
+            event_type="AUTHENTICATION SUCCESS",
+            status="ALLOWED",
+            detector="Authentication",
+            reasons=["User authenticated successfully."],
+            telemetry_metadata={
+                **security_event_metadata(
+                    category="authentication",
+                    reason_code="login_success",
+                    severity="LOW",
+                    username=user.username,
+                ),
+                "endpoint": "/auth/login",
+            },
+        )
+
+        return LoginResponse(
+            access_token=token,
+            token_type="bearer",
+            expires_in=token_manager.ttl_seconds,
+            username=user.username,
+            roles=sorted(user.roles),
+        )
+
+    except HTTPException:
+        raise
+
+    except AuthenticationError:
+        add_audit_event(
+            event_type="AUTHENTICATION FAILURE",
+            status="BLOCKED",
+            detector="Authentication",
+            reasons=["Invalid username or password."],
+            telemetry_metadata={
+                **security_event_metadata(
+                    category="authentication",
+                    reason_code="invalid_credentials",
+                    severity="WARNING",
+                ),
+                "endpoint": "/auth/login",
+            },
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    except Exception:
+        logger.exception("Authentication request failed.")
+        record_internal_error(
+            endpoint="/auth/login",
+            reason_code="login_internal_error",
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error.",
+        )
+
+
 # INFO
 # ============================================================================
 
@@ -1227,7 +1427,7 @@ def info():
             ),
         }
 
-    except Exception as exc:
+    except Exception:
 
         logger.exception(
             "Unable to load API information."
@@ -1285,6 +1485,9 @@ def setup(
         # Clear the persistent audit trail.
         audit_logger.clear()
 
+        # A corpus reset also resets the uploaded-document inventory.
+        document_ingestion_service.clear()
+
         # If a poisoned document was requested, the setup operation itself
         # is useful to record in the audit trail.
 
@@ -1338,7 +1541,7 @@ def setup(
             ),
         }
 
-    except Exception as exc:
+    except Exception:
 
         logger.exception(
             "Setup failed."
@@ -1349,6 +1552,131 @@ def setup(
             reason_code="setup_internal_error",
         )
 
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error.",
+        )
+
+
+# ============================================================================
+# DOCUMENT UPLOAD / SECURE INGESTION
+# ============================================================================
+
+@app.post(
+    "/documents/upload",
+    response_model=DocumentUploadResponse,
+)
+async def upload_document(
+    file: UploadFile = File(...),
+    principal: AuthenticatedPrincipal = Depends(
+        require_permission("manage_documents")
+    ),
+    _rate_limit_principal: AuthenticatedPrincipal = Depends(
+        enforce_rate_limit("document_upload")
+    ),
+):
+    """Upload a document and scan it before indexing.
+
+    The file is never indexed until provenance, document-injection, poisoning,
+    contradiction, metadata-risk, and DLP checks have completed.
+    """
+
+    try:
+        filename = file.filename or "document.txt"
+        data = await file.read()
+        if not data:
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded document is empty.",
+            )
+
+        rag = get_rag_system()
+        username = getattr(principal, "username", "unknown")
+        result = document_ingestion_service.scan_and_ingest(
+            rag=rag,
+            filename=filename,
+            data=data,
+            username=username,
+        )
+
+        audit_status = "ALLOWED" if result["indexed"] else "BLOCKED"
+        event_type = (
+            "DOCUMENT UPLOAD INDEXED"
+            if result["indexed"]
+            else "DOCUMENT UPLOAD QUARANTINED"
+        )
+        add_audit_event(
+            event_type=event_type,
+            status=audit_status,
+            source=result["source"],
+            detector="+".join(result["detectors"]) if result["detectors"] else "DocumentIngestion",
+            score=float(result["risk_score"]),
+            reasons=result["reasons"],
+            telemetry_metadata={
+                **security_event_metadata(
+                    category="document_ingestion",
+                    reason_code=(
+                        "document_indexed"
+                        if result["indexed"]
+                        else "document_quarantined"
+                    ),
+                    severity="LOW" if result["indexed"] else "HIGH",
+                    username=username,
+                ),
+                "document_id": result["document_id"],
+                "extension": Path(result["source"]).suffix.lower(),
+                "size_bytes": result["size_bytes"],
+                "content_sha256": result["content_sha256"],
+                "risk_score": result["risk_score"],
+                "trust_score": result["trust_score"],
+                "classification": result["classification"],
+                "detectors": result["detectors"],
+            },
+        )
+
+        return DocumentUploadResponse(**result)
+
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=415, detail=str(exc))
+    except Exception:
+        logger.exception("Document upload failed.")
+        record_internal_error(
+            endpoint="/documents/upload",
+            reason_code="document_upload_internal_error",
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="Internal server error.",
+        )
+
+
+@app.get(
+    "/documents",
+    response_model=DocumentListResponse,
+)
+def list_documents(
+    principal: AuthenticatedPrincipal = Depends(
+        require_permission("read_audit")
+    ),
+):
+    """Return the non-sensitive uploaded-document inventory."""
+
+    try:
+        documents = document_ingestion_service.list_documents()
+        return DocumentListResponse(
+            total=len(documents),
+            documents=documents,
+        )
+    except Exception:
+        logger.exception("Document inventory request failed.")
+        record_internal_error(
+            endpoint="/documents",
+            reason_code="document_inventory_internal_error",
+        )
         raise HTTPException(
             status_code=500,
             detail="Internal server error.",
@@ -1576,7 +1904,7 @@ def attack(
     except HTTPException:
         raise
 
-    except Exception as exc:
+    except Exception:
 
         logger.exception(
             "Attack analysis failed."
@@ -1636,9 +1964,10 @@ def query(
             )
 
         logger.info(
-        "Protected query received. length=%d",
-        len(query_text),
-    )
+            "Protected query received: length=%d sha256=%s",
+            len(query_text),
+            safe_content_metadata(query_text)["content_sha256"],
+        )
 
         # --------------------------------------------------------------
         # Execute protected RAG
@@ -2003,7 +2332,7 @@ def query(
     except HTTPException:
         raise
 
-    except Exception as exc:
+    except Exception:
 
         logger.exception(
             "Query failed."
@@ -2178,7 +2507,7 @@ def get_audit(
             events=events,
         )
 
-    except Exception as exc:
+    except Exception:
 
         logger.exception(
             "Unable to read audit log."
@@ -2228,7 +2557,7 @@ def clear_audit(
             "removed_events": count,
         }
 
-    except Exception as exc:
+    except Exception:
 
         logger.exception(
             "Unable to clear audit log."
@@ -2249,9 +2578,48 @@ def clear_audit(
 # STARTUP
 # ============================================================================
 
+def provision_development_admin() -> None:
+    """Provision a local development administrator from environment variables."""
+
+    username = os.getenv(
+        "RAGSHIELD_ADMIN_USERNAME",
+        "admin",
+    )
+    password = os.getenv(
+        "RAGSHIELD_ADMIN_PASSWORD",
+    )
+
+    if not password:
+        logger.warning(
+            "RAGSHIELD_ADMIN_PASSWORD is not configured; "
+            "development admin account was not created."
+        )
+        return
+
+    try:
+        if user_store.get_user(username) is not None:
+            logger.info("Development admin account already exists.")
+            return
+    except Exception:
+        pass
+
+    try:
+        user_store.create_user(
+            username=username,
+            password=password,
+            roles=("admin",),
+            document_scopes=("*",),
+        )
+        logger.info("Development admin account provisioned.")
+    except Exception:
+        logger.exception("Unable to provision development admin account.")
+
+
 @app.on_event("startup")
 def startup_event():
     """Application startup."""
+
+    provision_development_admin()
 
     logger.info(
         "=================================================="
@@ -2271,6 +2639,10 @@ def startup_event():
 
     logger.info(
         "API authentication and RBAC enabled."
+    )
+
+    logger.info(
+        "Authentication endpoint available at /auth/login"
     )
 
     logger.info(
