@@ -377,6 +377,22 @@ function documentThreatCount(
   ).length;
 }
 
+type Workspace = {
+  id: string;
+  name: string;
+  description: string;
+  status: "active";
+};
+
+const workspaces: Workspace[] = [
+  {
+    id: "production-rag",
+    name: "Production RAG",
+    description: "Primary RAG security workspace",
+    status: "active",
+  },
+];
+
 const navigation = [
   { label: "Dashboard", icon: LayoutDashboard },
   { label: "Query", icon: Search },
@@ -516,6 +532,46 @@ function App() {
     return Number.isFinite(stored) && stored > 0 ? stored : null;
   });
   const [userMenuOpen, setUserMenuOpen] = useState(false);
+  const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
+  const [currentWorkspaceId, setCurrentWorkspaceId] = useState(() =>
+    sessionStorage.getItem("ragshield_workspace_id") ?? workspaces[0].id,
+  );
+
+  const currentWorkspace =
+    workspaces.find((workspace) => workspace.id === currentWorkspaceId) ??
+    workspaces[0];
+
+  useEffect(() => {
+    sessionStorage.setItem(
+      "ragshield_workspace_id",
+      currentWorkspace.id,
+    );
+  }, [currentWorkspace.id]);
+
+  useEffect(() => {
+    if (!workspaceMenuOpen) return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setWorkspaceMenuOpen(false);
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [workspaceMenuOpen]);
+
+  const handleWorkspaceSelect = (workspaceId: string) => {
+    const workspace = workspaces.find(
+      (candidate) => candidate.id === workspaceId,
+    );
+
+    if (!workspace) return;
+
+    setCurrentWorkspaceId(workspace.id);
+    setWorkspaceMenuOpen(false);
+    setSidebarOpen(false);
+  };
 
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [notificationsSeenAt, setNotificationsSeenAt] = useState<number>(() => {
@@ -1352,19 +1408,91 @@ function App() {
           </button>
         </div>
 
-        <div className="workspace-selector">
-          <div className="workspace-icon">
-            <Network size={17} />
-          </div>
+        <div className="workspace-selector-wrap">
+          <button
+            type="button"
+            className={`workspace-selector ${
+              workspaceMenuOpen
+                ? "workspace-selector-open"
+                : ""
+            }`}
+            onClick={() => setWorkspaceMenuOpen((open) => !open)}
+            aria-label="Select workspace"
+            aria-expanded={workspaceMenuOpen}
+            aria-haspopup="listbox"
+          >
+            <div className="workspace-icon">
+              <Network size={17} />
+            </div>
 
-          <div className="workspace-content">
-            <span>Workspace</span>
-            <strong>
-              Production RAG
-            </strong>
-          </div>
+            <div className="workspace-content">
+              <span>Workspace</span>
+              <strong>{currentWorkspace.name}</strong>
+            </div>
 
-          <ChevronDown size={16} />
+            <ChevronDown
+              size={16}
+              className={
+                workspaceMenuOpen
+                  ? "workspace-chevron-open"
+                  : ""
+              }
+            />
+          </button>
+
+          {workspaceMenuOpen && (
+            <div
+              className="workspace-menu"
+              role="listbox"
+              aria-label="Available workspaces"
+            >
+              <div className="workspace-menu-heading">
+                <span>WORKSPACES</span>
+                <small>Current workspace</small>
+              </div>
+
+              {workspaces.map((workspace) => {
+                const selected =
+                  workspace.id === currentWorkspace.id;
+
+                return (
+                  <button
+                    key={workspace.id}
+                    type="button"
+                    className={`workspace-option ${
+                      selected
+                        ? "workspace-option-selected"
+                        : ""
+                    }`}
+                    role="option"
+                    aria-selected={selected}
+                    onClick={() =>
+                      handleWorkspaceSelect(workspace.id)
+                    }
+                  >
+                    <div className="workspace-option-icon">
+                      <Network size={15} />
+                    </div>
+                    <div className="workspace-option-copy">
+                      <strong>{workspace.name}</strong>
+                      <span>{workspace.description}</span>
+                    </div>
+                    {selected && (
+                      <CheckCircle2
+                        size={16}
+                        className="workspace-option-check"
+                      />
+                    )}
+                  </button>
+                );
+              })}
+
+              <div className="workspace-menu-note">
+                Workspace isolation is being introduced incrementally;
+                backend data remains on the existing RAGShield context.
+              </div>
+            </div>
+          )}
         </div>
 
         <nav className="navigation">
