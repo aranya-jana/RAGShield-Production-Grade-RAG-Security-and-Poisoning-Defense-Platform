@@ -391,11 +391,41 @@ textarea:disabled {
 }
 
 .user-menu {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 9px;
   padding-left: 10px;
   border-left: 1px solid var(--border);
+}
+
+.user-menu-trigger {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 4px 5px 4px 0;
+  color: inherit;
+  background: transparent;
+  border-radius: 9px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.user-menu-trigger:hover,
+.user-menu-trigger-active {
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.user-menu-chevron {
+  flex: 0 0 auto;
+  color: var(--muted-2);
+  transition: transform 140ms ease, color 140ms ease;
+}
+
+.user-menu-chevron-open {
+  color: var(--text);
+  transform: rotate(180deg);
 }
 
 .avatar {
@@ -418,14 +448,181 @@ textarea:disabled {
 
 .user-details strong {
   color: var(--text);
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 650;
 }
 
 .user-details span {
   margin-top: 2px;
   color: var(--muted-2);
+  font-size: 10px;
+}
+
+.account-menu {
+  position: absolute;
+  top: calc(100% + 10px);
+  right: 0;
+  z-index: 1000;
+  width: 320px;
+  overflow: hidden;
+  padding: 7px;
+  background: var(--surface);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.42);
+}
+
+.account-menu-summary {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  column-gap: 10px;
+  padding: 9px 9px 11px;
+}
+
+.account-menu-avatar {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  color: var(--info);
+  background: var(--info-soft);
+  border-radius: 9px;
+}
+
+.account-menu-summary > div:last-of-type {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.account-menu-summary strong {
+  overflow: hidden;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-menu-summary > div:last-of-type span {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-status {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 9px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.account-status .status-dot {
+  width: 6px;
+  height: 6px;
+  flex-basis: 6px;
+}
+
+.account-menu-divider {
+  height: 1px;
+  margin: 0 3px 5px;
+  background: var(--border);
+}
+
+.account-menu-item,
+.account-menu-signout,
+.account-menu-signin {
+  width: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 9px;
+  color: var(--muted);
+  background: transparent;
+  border-radius: 8px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.account-menu-item:hover,
+.account-menu-signin:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+.account-menu-item > svg,
+.account-menu-signout > svg,
+.account-menu-signin > svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.account-menu-item > span {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.account-menu-item strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.account-menu-item small {
+  color: var(--muted-2);
+  font-size: 10px;
+  line-height: 1.45;
+}
+
+.account-menu-session {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 3px 4px;
+  padding: 9px;
+  background: #090f17;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.account-menu-session span {
+  color: var(--muted-2);
   font-size: 9px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.account-menu-session strong {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 550;
+  line-height: 1.45;
+}
+
+.account-menu-signout {
+  align-items: center;
+  margin-top: 3px;
+  color: #f0aab1;
+}
+
+.account-menu-signout:hover {
+  color: #ffd4d9;
+  background: var(--danger-soft);
+}
+
+.account-menu-signin {
+  align-items: center;
+  color: var(--info);
 }
 
 .page-content {
@@ -1893,9 +2090,23 @@ textarea:disabled {
   }
 
   .live-indicator,
-  .user-details,
-  .user-menu > svg {
+  .user-details {
     display: none;
+  }
+
+  .user-menu-trigger {
+    padding-right: 0;
+  }
+
+  .user-menu-chevron {
+    display: none;
+  }
+
+  .account-menu {
+    position: fixed;
+    top: 65px;
+    right: 12px;
+    width: min(320px, calc(100vw - 24px));
   }
 
   .page-content {

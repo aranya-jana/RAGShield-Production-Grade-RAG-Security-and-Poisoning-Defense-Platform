@@ -30,6 +30,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   Users,
+  UserRound,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -497,6 +498,24 @@ function App() {
   const [loginLoading, setLoginLoading] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
   const [authenticated, setAuthenticated] = useState(hasApiToken());
+  const [roles, setRoles] = useState<string[]>(() => {
+    try {
+      const stored = sessionStorage.getItem("ragshield_roles");
+      const parsed = stored ? JSON.parse(stored) : [];
+      return Array.isArray(parsed)
+        ? parsed.filter((role): role is string => typeof role === "string")
+        : [];
+    } catch {
+      return [];
+    }
+  });
+  const [sessionExpiresAt, setSessionExpiresAt] = useState<number | null>(() => {
+    const stored = Number(
+      sessionStorage.getItem("ragshield_session_expires_at") ?? 0,
+    );
+    return Number.isFinite(stored) && stored > 0 ? stored : null;
+  });
+  const [userMenuOpen, setUserMenuOpen] = useState(false);
 
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [notificationsSeenAt, setNotificationsSeenAt] = useState<number>(() => {
@@ -666,12 +685,42 @@ function App() {
       setApiTokenState("••••••••••••••••");
       setAuthenticated(true);
       setShowTokenInput(false);
-      setUsername(data.username || loginUsername);
+      const authenticatedUsername =
+        data.username || loginUsername;
+      const authenticatedRoles = Array.isArray(data.roles)
+        ? data.roles.filter(
+            (role): role is string => typeof role === "string",
+          )
+        : [];
+      const expiresAt =
+        Number.isFinite(Number(data.expires_in)) &&
+        Number(data.expires_in) > 0
+          ? Date.now() + Number(data.expires_in) * 1000
+          : null;
+
+      setUsername(authenticatedUsername);
+      setRoles(authenticatedRoles);
+      setSessionExpiresAt(expiresAt);
       setLoginPassword("");
       sessionStorage.setItem(
         "ragshield_username",
-        data.username || loginUsername,
+        authenticatedUsername,
       );
+      sessionStorage.setItem(
+        "ragshield_roles",
+        JSON.stringify(authenticatedRoles),
+      );
+      if (expiresAt) {
+        sessionStorage.setItem(
+          "ragshield_session_expires_at",
+          String(expiresAt),
+        );
+      } else {
+        sessionStorage.removeItem(
+          "ragshield_session_expires_at",
+        );
+      }
+      setUserMenuOpen(false);
       setLoginError(null);
     } catch (error) {
       setAuthenticated(false);
@@ -697,7 +746,21 @@ function App() {
     setQueryResult(null);
     setQueryError(null);
     setLoginError(null);
+    setRoles([]);
+    setSessionExpiresAt(null);
+    setUserMenuOpen(false);
+    setNotificationsOpen(false);
     sessionStorage.removeItem("ragshield_username");
+    sessionStorage.removeItem("ragshield_roles");
+    sessionStorage.removeItem("ragshield_session_expires_at");
+  };
+
+  const handleUserMenuNavigation = (
+    page: "Access Control" | "Settings",
+  ) => {
+    setActivePage(page);
+    setUserMenuOpen(false);
+    setSidebarOpen(false);
   };
 
   const handleQuery = async () => {
@@ -1493,34 +1556,155 @@ function App() {
             </div>
 
             <div className="user-menu">
-              <div className="avatar">
-                AD
-              </div>
-
-              <div className="user-details">
-                <strong>
+              <button
+                className={`user-menu-trigger ${
+                  userMenuOpen ? "user-menu-trigger-active" : ""
+                }`}
+                onClick={() =>
+                  setUserMenuOpen((open) => !open)
+                }
+                aria-label={
+                  authenticated
+                    ? "Open account menu"
+                    : "Open sign-in menu"
+                }
+                aria-expanded={userMenuOpen}
+                aria-haspopup="menu"
+                title={
+                  authenticated
+                    ? "Account"
+                    : "Authentication"
+                }
+              >
+                <div className="avatar">
                   {authenticated && username
                     ? username
-                    : "Not signed in"}
-                </strong>
-                <span>
-                  {authenticated
-                    ? "Authenticated"
-                    : "Authentication required"}
-                </span>
-              </div>
+                        .trim()
+                        .split(/\s+/)
+                        .slice(0, 2)
+                        .map((part) => part[0]?.toUpperCase() ?? "")
+                        .join("") || "RS"
+                    : "RS"}
+                </div>
 
-              {authenticated ? (
-                <button
-                  className="icon-button"
-                  onClick={handleLogout}
-                  aria-label="Sign out"
-                  title="Sign out"
+                <div className="user-details">
+                  <strong>
+                    {authenticated && username
+                      ? username
+                      : "Not signed in"}
+                  </strong>
+                  <span>
+                    {authenticated
+                      ? roles.length > 0
+                        ? roles.join(" · ")
+                        : "Authenticated"
+                      : "Authentication required"}
+                  </span>
+                </div>
+
+                <ChevronDown
+                  size={15}
+                  className={`user-menu-chevron ${
+                    userMenuOpen
+                      ? "user-menu-chevron-open"
+                      : ""
+                  }`}
+                />
+              </button>
+
+              {userMenuOpen && (
+                <div
+                  className="account-menu"
+                  role="menu"
+                  aria-label="Account controls"
                 >
-                  <LogOut size={16} />
-                </button>
-              ) : (
-                <LogIn size={16} />
+                  {authenticated ? (
+                    <>
+                      <div className="account-menu-summary">
+                        <div className="account-menu-avatar">
+                          <UserRound size={17} />
+                        </div>
+                        <div>
+                          <strong>{username || "Authenticated user"}</strong>
+                          <span>
+                            {roles.length > 0
+                              ? roles.join(" · ")
+                              : "Authenticated"}
+                          </span>
+                        </div>
+                        <span className="account-status">
+                          <span className="status-dot status-dot-green" />
+                          Authenticated
+                        </span>
+                      </div>
+
+                      <div className="account-menu-divider" />
+
+                      <button
+                        className="account-menu-item"
+                        role="menuitem"
+                        onClick={() =>
+                          handleUserMenuNavigation(
+                            "Access Control",
+                          )
+                        }
+                      >
+                        <UserRound size={15} />
+                        <span>
+                          <strong>Account / Profile</strong>
+                          <small>View your current identity and role access.</small>
+                        </span>
+                      </button>
+
+                      <button
+                        className="account-menu-item"
+                        role="menuitem"
+                        onClick={() =>
+                          handleUserMenuNavigation("Settings")
+                        }
+                      >
+                        <ShieldCheck size={15} />
+                        <span>
+                          <strong>Security information</strong>
+                          <small>Review active protection and runtime controls.</small>
+                        </span>
+                      </button>
+
+                      <div className="account-menu-session">
+                        <span>Session</span>
+                        <strong>
+                          {sessionExpiresAt
+                            ? `Expires ${new Date(
+                                sessionExpiresAt,
+                              ).toLocaleString()}`
+                            : "Active"}
+                        </strong>
+                      </div>
+
+                      <button
+                        className="account-menu-signout"
+                        role="menuitem"
+                        onClick={handleLogout}
+                      >
+                        <LogOut size={15} />
+                        Sign out
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      className="account-menu-signin"
+                      role="menuitem"
+                      onClick={() => {
+                        setShowTokenInput(true);
+                        setActivePage("Dashboard");
+                        setUserMenuOpen(false);
+                      }}
+                    >
+                      <LogIn size={15} />
+                      Sign in to RAGShield
+                    </button>
+                  )}
+                </div>
               )}
             </div>
           </div>
@@ -1597,6 +1781,7 @@ function App() {
             <AccessControlPage
               authenticated={authenticated}
               username={username}
+              roles={roles}
               onSignIn={() => {
                 setShowTokenInput(true);
                 setActivePage("Dashboard");
@@ -3035,11 +3220,13 @@ function SettingsPage({
 function AccessControlPage({
   authenticated,
   username,
+  roles,
   onSignIn,
   onSignOut,
 }: {
   authenticated: boolean;
   username: string;
+  roles: string[];
   onSignIn: () => void;
   onSignOut: () => void;
 }) {
@@ -3050,6 +3237,7 @@ function AccessControlPage({
         <div className="panel-header"><div><div className="panel-kicker">CURRENT SESSION</div><h3>{authenticated ? "Authenticated session" : "Authentication required"}</h3></div><span className={`status-pill ${authenticated ? "status-pill-safe" : "status-pill-danger"}`}>{authenticated ? "AUTHENTICATED" : "SIGNED OUT"}</span></div>
         <div className="runtime-grid">
           <RuntimeItem label="Username" value={authenticated ? username || "authenticated user" : "—"} />
+          <RuntimeItem label="Role(s)" value={authenticated ? (roles.length > 0 ? roles.join(", ") : "Not provided") : "—"} />
           <RuntimeItem label="Token" value="Stored securely · never rendered" />
           <RuntimeItem label="Authorization" value={authenticated ? "Bearer access token" : "Not active"} />
         </div>
