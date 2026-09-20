@@ -2089,6 +2089,7 @@ function DashboardPage({
   info,
   audit,
   auditLoading,
+  documents,
   queryResult,
   queryText,
   queryError,
@@ -2162,6 +2163,56 @@ function DashboardPage({
   onOpenDocuments: () => void;
   onRefresh: () => void;
 }) {
+  const dashboardAuditEvents = audit?.events ?? [];
+
+  const dashboardDocumentThreats = documents.filter(
+    (doc) =>
+      doc.status === "QUARANTINED" ||
+      doc.poison_detected ||
+      doc.injection_detected ||
+      doc.contradiction_detected ||
+      doc.dlp_detected,
+  ).length;
+
+  const dashboardBlockedAuditEvents = dashboardAuditEvents.filter(
+    (event) => isBlockedEvent(event),
+  ).length;
+
+  const dashboardAuthenticationEvents = dashboardAuditEvents.filter((event) => {
+    const type = String(event.event_type ?? "").toLowerCase();
+    return type.includes("authentication") || type.includes("authorization");
+  }).length;
+
+  const dashboardAttentionEvents = dashboardAuditEvents
+    .filter((event) => {
+      const status = String(event.status ?? "").toUpperCase();
+      const severity = String(event.severity ?? "").toLowerCase();
+      return (
+        status === "BLOCKED" ||
+        severity === "critical" ||
+        severity === "high"
+      );
+    })
+    .slice(0, 4);
+
+  const dashboardPostureLabel =
+    !systemOperational
+      ? "Backend unavailable"
+      : highestRisk >= 70 || dashboardBlockedAuditEvents > 0
+        ? "Elevated attention"
+        : highestRisk >= 40 || quarantinedCount > 0
+          ? "Guarded"
+          : "Protected";
+
+  const dashboardPostureClass =
+    !systemOperational
+      ? "dashboard-posture-unavailable"
+      : dashboardPostureLabel === "Elevated attention"
+        ? "dashboard-posture-danger"
+        : dashboardPostureLabel === "Guarded"
+          ? "dashboard-posture-warning"
+          : "dashboard-posture-safe";
+
   const latestStatus =
     queryResult?.security.status ??
     null;
@@ -2393,6 +2444,215 @@ function DashboardPage({
           trendLabel="last 24 hours"
           alert={threatCount > 0}
         />
+      </section>
+
+      <section className="dashboard-command-center">
+        <div className="panel dashboard-command-posture">
+          <div className="panel-header">
+            <div>
+              <div className="panel-kicker">SECURITY COMMAND CENTER</div>
+              <h3>Operational security posture</h3>
+            </div>
+            <div className="panel-icon">
+              <Gauge size={19} />
+            </div>
+          </div>
+
+          <div className={`dashboard-posture-status ${dashboardPostureClass}`}>
+            <div className="dashboard-posture-status-icon">
+              {dashboardPostureLabel === "Protected" ? (
+                <ShieldCheck size={18} />
+              ) : dashboardPostureLabel === "Guarded" ? (
+                <ShieldAlert size={18} />
+              ) : (
+                <AlertTriangle size={18} />
+              )}
+            </div>
+            <div>
+              <strong>{dashboardPostureLabel}</strong>
+              <span>
+                {systemOperational
+                  ? "Based on current backend health, document security, and audit activity."
+                  : "Live security posture cannot be verified until the backend is reachable."}
+              </span>
+            </div>
+          </div>
+
+          <div className="dashboard-posture-metrics">
+            <div>
+              <span>Highest document risk</span>
+              <strong>{Math.round(normalizeSecurityScore(highestRisk))}/100</strong>
+            </div>
+            <div>
+              <span>Lowest document trust</span>
+              <strong>{Math.round(normalizeSecurityScore(currentTrust))}/100</strong>
+            </div>
+            <div>
+              <span>Quarantined</span>
+              <strong>{quarantinedCount}</strong>
+            </div>
+          </div>
+        </div>
+
+        <div className="panel dashboard-command-threats">
+          <div className="panel-header">
+            <div>
+              <div className="panel-kicker">THREAT CHANNELS</div>
+              <h3>Where attention is coming from</h3>
+            </div>
+            <div className="panel-icon">
+              <ShieldAlert size={19} />
+            </div>
+          </div>
+
+          <div className="dashboard-threat-list">
+            <button
+              type="button"
+              className="dashboard-threat-row"
+              onClick={onOpenDocuments}
+            >
+              <span className="dashboard-threat-icon dashboard-threat-icon-danger">
+                <FileWarning size={15} />
+              </span>
+              <span className="dashboard-threat-copy">
+                <strong>Document security</strong>
+                <small>Quarantined or detector-triggered documents</small>
+              </span>
+              <strong className="dashboard-threat-value">
+                {dashboardDocumentThreats}
+              </strong>
+            </button>
+
+            <button
+              type="button"
+              className="dashboard-threat-row"
+              onClick={onOpenAudit}
+            >
+              <span className="dashboard-threat-icon dashboard-threat-icon-warning">
+                <Activity size={15} />
+              </span>
+              <span className="dashboard-threat-copy">
+                <strong>Blocked security events</strong>
+                <small>Audit events currently recorded as blocked</small>
+              </span>
+              <strong className="dashboard-threat-value">
+                {dashboardBlockedAuditEvents}
+              </strong>
+            </button>
+
+            <button
+              type="button"
+              className="dashboard-threat-row"
+              onClick={onOpenAudit}
+            >
+              <span className="dashboard-threat-icon dashboard-threat-icon-info">
+                <Users size={15} />
+              </span>
+              <span className="dashboard-threat-copy">
+                <strong>Authentication & authorization</strong>
+                <small>Identity and access-control security events</small>
+              </span>
+              <strong className="dashboard-threat-value">
+                {dashboardAuthenticationEvents}
+              </strong>
+            </button>
+          </div>
+        </div>
+
+        <div className="panel dashboard-command-activity">
+          <div className="panel-header">
+            <div>
+              <div className="panel-kicker">24-HOUR ACTIVITY</div>
+              <h3>Security event volume</h3>
+            </div>
+            <div className="panel-icon">
+              <BarChart3 size={19} />
+            </div>
+          </div>
+
+          <div className="dashboard-activity-summary">
+            <strong>{dashboardAuditEvents.length}</strong>
+            <span>events in the current audit window</span>
+          </div>
+
+          <div className="dashboard-activity-bars" aria-label="24 hour security activity">
+            {activityBuckets.map((value, index) => {
+              const height =
+                maxActivity > 0
+                  ? Math.max(8, (value / maxActivity) * 100)
+                  : 8;
+              return (
+                <div
+                  className="dashboard-activity-bar-wrap"
+                  key={`${index}-${value}`}
+                  title={`${value} event${value === 1 ? "" : "s"}`}
+                >
+                  <div
+                    className={`dashboard-activity-bar ${
+                      value > 0 ? "dashboard-activity-bar-live" : ""
+                    }`}
+                    style={{ height: `${height}%` }}
+                  />
+                </div>
+              );
+            })}
+          </div>
+
+          <div className="dashboard-activity-labels">
+            <span>24h</span>
+            <span>18h</span>
+            <span>12h</span>
+            <span>6h</span>
+            <span>Now</span>
+          </div>
+        </div>
+
+        <div className="panel dashboard-command-attention">
+          <div className="panel-header">
+            <div>
+              <div className="panel-kicker">ATTENTION QUEUE</div>
+              <h3>Recent high-signal events</h3>
+            </div>
+            <button
+              type="button"
+              className="dashboard-inline-link"
+              onClick={onOpenAudit}
+            >
+              View audit
+              <ExternalLink size={13} />
+            </button>
+          </div>
+
+          {dashboardAttentionEvents.length === 0 ? (
+            <div className="dashboard-attention-empty">
+              <CheckCircle2 size={18} />
+              <span>No high-severity or blocked events in the current audit data.</span>
+            </div>
+          ) : (
+            <div className="dashboard-attention-list">
+              {dashboardAttentionEvents.map((event) => (
+                <button
+                  type="button"
+                  className="dashboard-attention-row"
+                  key={event.event_id}
+                  onClick={onOpenAudit}
+                >
+                  <span className="dashboard-attention-severity">
+                    {String(event.severity ?? "").toUpperCase() || "HIGH"}
+                  </span>
+                  <span className="dashboard-attention-copy">
+                    <strong>{auditEventTitle(event)}</strong>
+                    <small>
+                      {event.source ?? event.endpoint ?? "Security event"} ·{" "}
+                      {relativeTime(event.timestamp)}
+                    </small>
+                  </span>
+                  <ChevronDown size={14} className="dashboard-attention-arrow" />
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
       </section>
 
       <section className="dashboard-grid dashboard-primary-grid">
