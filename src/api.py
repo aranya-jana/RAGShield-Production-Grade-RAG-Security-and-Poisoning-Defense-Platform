@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from src.request_size_limit import RequestSizeLimitMiddleware
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -188,6 +188,19 @@ RATE_LIMITS = {
         "limit": 10,
         "window_seconds": 60,
     },
+    # Authentication is intentionally rate-limited before credential
+    # verification because PBKDF2 verification is computationally expensive.
+    # The username and client-address limits provide separate controls so a
+    # single source cannot repeatedly target one account or exhaust the
+    # authentication endpoint from one address.
+    "login_ip": {
+        "limit": 12,
+        "window_seconds": 60,
+    },
+    "login_username": {
+        "limit": 6,
+        "window_seconds": 60,
+    },
 }
 
 
@@ -245,8 +258,12 @@ def get_current_principal(
         )
 
     try:
+        # Re-check current account state on every authenticated request.
+        # This prevents a token issued before account disablement from
+        # remaining usable until its normal expiration time.
         return token_manager.validate(
-            credentials.credentials
+            credentials.credentials,
+            user_lookup=user_store.get_user,
         )
 
     except (
@@ -505,9 +522,20 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    # RAGShield uses an Authorization header rather than browser cookies.
+    # Credentials therefore do not need to be enabled for the local frontend.
+    allow_credentials=False,
+    allow_methods=[
+        "GET",
+        "POST",
+        "DELETE",
+        "OPTIONS",
+    ],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-Request-ID",
+    ],
 )
 
 
@@ -1299,14 +1327,99 @@ def health():
 # AUTHENTICATION
 # ============================================================================
 
+def _enforce_login_rate_limits(
+    request: Request,
+    username: str,
+) -> None:
+    """
+    Apply unauthenticated login throttling before password verification.
+
+    The current limiter is process-local, matching the rest of the local
+    deployment. Production multi-worker deployments should move this control
+    to a shared store such as Redis.
+    """
+
+    normalized_username = username.strip().lower()
+    client_host = (
+        request.client.host
+        if request.client is not None
+        else "unknown"
+    )
+
+    checks = (
+        (
+            "login_ip",
+            f"login-ip:{client_host}",
+        ),
+        (
+            "login_username",
+            f"login-user:{normalized_username}",
+        ),
+    )
+
+    for scope, client_key in checks:
+        settings = RATE_LIMITS[scope]
+        decision = rate_limiter.check(
+            client_key=client_key,
+            scope=scope,
+            limit=settings["limit"],
+            window_seconds=settings["window_seconds"],
+        )
+
+        if decision.allowed:
+            continue
+
+        add_audit_event(
+            event_type="RATE LIMIT VIOLATION",
+            status="BLOCKED",
+            detector="RateLimiter",
+            reasons=["Authentication rate limit exceeded."],
+            telemetry_metadata={
+                **security_event_metadata(
+                    category="rate_limit",
+                    reason_code="login_rate_limit_exceeded",
+                    severity="HIGH",
+                    username=normalized_username,
+                ),
+                "endpoint": "/auth/login",
+                "scope": scope,
+                "limit": decision.limit,
+                "remaining": decision.remaining,
+                "retry_after_seconds": decision.retry_after_seconds,
+            },
+        )
+
+        raise HTTPException(
+            status_code=429,
+            detail="Too many authentication attempts. Please retry later.",
+            headers={
+                "Retry-After": str(
+                    decision.retry_after_seconds
+                ),
+                "X-RateLimit-Limit": str(
+                    decision.limit
+                ),
+                "X-RateLimit-Remaining": "0",
+            },
+        )
+
+
 @app.post(
     "/auth/login",
     response_model=LoginResponse,
 )
-def login(request: LoginRequest):
+def login(
+    request: LoginRequest,
+    http_request: Request,
+):
     """Authenticate a user and issue a signed RAGShield bearer token."""
 
     try:
+        _enforce_login_rate_limits(
+            http_request,
+            request.username,
+        )
+
         user = user_store.authenticate(
             username=request.username,
             password=request.password,
