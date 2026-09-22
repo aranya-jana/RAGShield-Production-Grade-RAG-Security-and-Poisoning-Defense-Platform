@@ -61,6 +61,38 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+def _get_bool_env(
+    name: str,
+    default: bool,
+) -> bool:
+    """Read a boolean environment variable safely."""
+    value = os.getenv(name)
+
+    if value is None:
+        return default
+
+    return value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _get_cors_origins() -> List[str]:
+    """Return configured browser origins for CORS."""
+    raw_origins = os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:5173,http://127.0.0.1:5173",
+    )
+
+    origins = [
+        origin.strip().rstrip("/")
+        for origin in raw_origins.split(",")
+        if origin.strip()
+    ]
+
+    return origins
 
 # ============================================================================
 # PROJECT IMPORTS
@@ -518,10 +550,7 @@ def enforce_rate_limit(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=_get_cors_origins(),
     # RAGShield uses an Authorization header rather than browser cookies.
     # Credentials therefore do not need to be enabled for the local frontend.
     allow_credentials=False,
@@ -873,7 +902,6 @@ def get_rag_system() -> RAGSystem:
         # Local Ollama.
         llm = create_llm(
             config,
-            provider="ollama",
         )
 
         rag_system = RAGSystem(
@@ -2692,7 +2720,16 @@ def clear_audit(
 # ============================================================================
 
 def provision_development_admin() -> None:
-    """Provision a local development administrator from environment variables."""
+    """Provision a local development administrator when explicitly enabled."""
+
+    if not _get_bool_env(
+        "RAGSHIELD_DEV_ADMIN_PROVISIONING",
+        True,
+    ):
+        logger.info(
+            "Development admin provisioning is disabled."
+        )
+        return
 
     username = os.getenv(
         "RAGSHIELD_ADMIN_USERNAME",
@@ -2743,7 +2780,8 @@ def startup_event():
     )
 
     logger.info(
-        "Frontend CORS enabled for localhost:5173"
+        "Frontend CORS origins configured: %s",
+        _get_cors_origins(),
     )
 
     logger.info(

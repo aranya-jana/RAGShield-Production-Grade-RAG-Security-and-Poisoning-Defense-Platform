@@ -1,4 +1,4 @@
-import type {
+﻿import type {
   ApiError,
   AttackRequest,
   AttackResponse,
@@ -11,9 +11,10 @@ import type {
   SetupResponse,
 } from "../types/api";
 
-const API_BASE_URL =
+const API_BASE_URL = (
   import.meta.env.VITE_API_BASE_URL ??
-  "http://127.0.0.1:8000";
+  "http://127.0.0.1:8000"
+).replace(/\/+$/, "");
 
 const TOKEN_STORAGE_KEY =
   "ragshield_access_token";
