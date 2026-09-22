@@ -74,6 +74,20 @@ TOKEN_ALGORITHM = "HS256"
 
 AUTH_SECRET_ENV = "RAGSHIELD_AUTH_SECRET"
 
+def _get_bool_env(
+    name: str,
+    default: bool,
+) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    return value.strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -626,9 +640,9 @@ class TokenManager:
     RAGSHIELD_AUTH_SECRET. This allows tokens to remain valid across process
     restarts.
 
-    Revocation is process-local because the current RAGShield user store is
-    in-memory. A persistent revocation store should be used when deploying
-    multiple API workers.
+    Token revocation is persisted when a database is configured, allowing
+    revoked tokens to remain revoked across process restarts and API workers
+    that share the same database.
     """
 
     def __init__(
@@ -651,8 +665,17 @@ class TokenManager:
         )
 
         if configured_secret is None:
+            if not _get_bool_env(
+                "RAGSHIELD_DEV_ADMIN_PROVISIONING",
+                True,
+            ):
+                raise ValueError(
+                    "RAGSHIELD_AUTH_SECRET must be configured "
+                    "when development admin provisioning is disabled."
+                )
+
             # Local-development fallback. This deliberately does not provide
-            # restart persistence; production deployments should configure
+            # restart persistence; production deployments must configure
             # RAGSHIELD_AUTH_SECRET.
             configured_secret = (
                 secrets.token_urlsafe(48)

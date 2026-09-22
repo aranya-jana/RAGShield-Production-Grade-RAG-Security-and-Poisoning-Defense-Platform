@@ -77,3 +77,15 @@ def test_token_revocation_persists_across_managers(
 
     assert manager_one.is_revoked(token) is True
     assert manager_two.is_revoked(token) is True
+
+
+def test_token_manager_requires_configured_secret_when_production_mode(monkeypatch) -> None:
+    monkeypatch.delenv("RAGSHIELD_AUTH_SECRET", raising=False)
+    monkeypatch.setenv("RAGSHIELD_DEV_ADMIN_PROVISIONING", "false")
+
+    try:
+        TokenManager()
+    except ValueError as exc:
+        assert "RAGSHIELD_AUTH_SECRET" in str(exc)
+    else:
+        raise AssertionError("TokenManager should require a configured auth secret in production mode")
