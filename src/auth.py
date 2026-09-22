@@ -53,6 +53,7 @@ from typing import (
     Set,
 )
 
+from src.database import Database
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -271,22 +272,18 @@ class PasswordHasher:
 
 
 class UserStore:
-    """
-    In-memory user store.
-
-    This preserves the existing local-development architecture. A persistent
-    database-backed store can be introduced later without changing the token
-    or RBAC contracts.
-    """
+    """User account store with optional persistent SQLite backing."""
 
     def __init__(
         self,
         password_hasher: Optional[PasswordHasher] = None,
+        database: Optional[Database] = None,
     ) -> None:
         self.password_hasher = (
             password_hasher
             or PasswordHasher()
         )
+        self.database = database
 
         self._users: Dict[str, User] = {}
 
@@ -332,6 +329,56 @@ class UserStore:
 
         return normalized
 
+    @staticmethod
+    def _serialize_values(
+        values: Iterable[str],
+    ) -> str:
+        return json.dumps(
+            sorted(
+                str(value)
+                for value in values
+            ),
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def _deserialize_values(
+        value: str,
+    ) -> tuple[str, ...]:
+        parsed = json.loads(value)
+
+        if not isinstance(parsed, list):
+            raise ValueError(
+                "Persisted user collection must be a JSON array."
+            )
+
+        return tuple(
+            str(item)
+            for item in parsed
+        )
+
+    @classmethod
+    def _user_from_row(
+        cls,
+        row: Mapping[str, object],
+    ) -> User:
+        return User(
+            username=str(row["username"]),
+            password_hash=str(row["password_hash"]),
+            password_salt=str(row["password_salt"]),
+            roles=cls._normalize_roles(
+                cls._deserialize_values(
+                    str(row["roles"])
+                )
+            ),
+            document_scopes=cls._normalize_scopes(
+                cls._deserialize_values(
+                    str(row["document_scopes"])
+                )
+            ),
+            disabled=bool(row["disabled"]),
+        )
+
     def create_user(
         self,
         username: str,
@@ -347,7 +394,14 @@ class UserStore:
             )
         )
 
-        if normalized_username in self._users:
+        if self.database is not None:
+            if self.database.get_user(
+                normalized_username
+            ) is not None:
+                raise ValueError(
+                    f"User already exists: {normalized_username}"
+                )
+        elif normalized_username in self._users:
             raise ValueError(
                 f"User already exists: {normalized_username}"
             )
@@ -379,9 +433,23 @@ class UserStore:
             disabled=bool(disabled),
         )
 
-        self._users[
-            normalized_username
-        ] = user
+        if self.database is not None:
+            self.database.insert_user(
+                username=user.username,
+                password_hash=user.password_hash,
+                password_salt=user.password_salt,
+                roles=self._serialize_values(
+                    user.roles
+                ),
+                document_scopes=self._serialize_values(
+                    user.document_scopes
+                ),
+                disabled=user.disabled,
+            )
+        else:
+            self._users[
+                normalized_username
+            ] = user
 
         return user
 
@@ -395,6 +463,18 @@ class UserStore:
                 username
             )
         )
+
+        if self.database is not None:
+            row = self.database.get_user(
+                normalized_username
+            )
+
+            if row is None:
+                raise AuthenticationError(
+                    "Invalid username or password."
+                )
+
+            return self._user_from_row(row)
 
         user = self._users.get(
             normalized_username
@@ -431,16 +511,29 @@ class UserStore:
 
         return user
 
-    def disable_user(
+    def _set_disabled(
         self,
         username: str,
+        disabled: bool,
     ) -> User:
-        """Disable an existing user account."""
         normalized_username = (
             self._normalize_username(
                 username
             )
         )
+
+        if self.database is not None:
+            if not self.database.set_user_disabled(
+                normalized_username,
+                disabled,
+            ):
+                raise AuthenticationError(
+                    "User not found."
+                )
+
+            return self.get_user(
+                normalized_username
+            )
 
         user = self._users.get(
             normalized_username
@@ -451,58 +544,49 @@ class UserStore:
                 "User not found."
             )
 
-        disabled_user = User(
+        updated_user = User(
             username=user.username,
             password_hash=user.password_hash,
             password_salt=user.password_salt,
             roles=user.roles,
             document_scopes=user.document_scopes,
-            disabled=True,
+            disabled=disabled,
         )
 
         self._users[
             normalized_username
-        ] = disabled_user
+        ] = updated_user
 
-        return disabled_user
+        return updated_user
+
+    def disable_user(
+        self,
+        username: str,
+    ) -> User:
+        """Disable an existing user account."""
+        return self._set_disabled(
+            username,
+            True,
+        )
 
     def enable_user(
         self,
         username: str,
     ) -> User:
         """Enable an existing user account."""
-        normalized_username = (
-            self._normalize_username(
-                username
-            )
+        return self._set_disabled(
+            username,
+            False,
         )
-
-        user = self._users.get(
-            normalized_username
-        )
-
-        if user is None:
-            raise AuthenticationError(
-                "User not found."
-            )
-
-        enabled_user = User(
-            username=user.username,
-            password_hash=user.password_hash,
-            password_salt=user.password_salt,
-            roles=user.roles,
-            document_scopes=user.document_scopes,
-            disabled=False,
-        )
-
-        self._users[
-            normalized_username
-        ] = enabled_user
-
-        return enabled_user
 
     def all_users(self) -> tuple[User, ...]:
         """Return users without exposing mutable internal storage."""
+        if self.database is not None:
+            return tuple(
+                self._user_from_row(row)
+                for row in self.database.list_users()
+            )
+
         return tuple(
             self._users.values()
         )
@@ -551,6 +635,7 @@ class TokenManager:
         self,
         secret: Optional[str] = None,
         ttl_seconds: int = DEFAULT_TOKEN_TTL_SECONDS,
+        database: Optional[Database] = None,
     ) -> None:
         if ttl_seconds <= 0:
             raise ValueError(
@@ -597,6 +682,8 @@ class TokenManager:
         self.ttl_seconds = int(
             ttl_seconds
         )
+
+        self.database = database
 
         self._revoked_tokens: Set[str] = set()
         self._revocation_lock = (
@@ -786,6 +873,12 @@ class TokenManager:
                 token_fingerprint
             )
 
+            if self.database is not None:
+                self.database.revoke_token(
+                    token_fingerprint,
+                    int(time.time()),
+                )
+
     def is_revoked(
         self,
         token: str,
@@ -804,10 +897,15 @@ class TokenManager:
         )
 
         with self._revocation_lock:
-            return (
-                token_fingerprint
-                in self._revoked_tokens
-            )
+            if token_fingerprint in self._revoked_tokens:
+                return True
+
+            if self.database is not None:
+                return self.database.is_token_revoked(
+                    token_fingerprint
+                )
+
+            return False
 
     def _token_fingerprint(
         self,

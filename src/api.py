@@ -34,6 +34,7 @@ import uuid
 from pathlib import Path
 from typing import List, Optional
 
+
 from src.request_size_limit import RequestSizeLimitMiddleware
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -107,6 +108,7 @@ try:
     from src.rag_system import RAGSystem
     from src.audit_logger import SecurityAuditLogger
     from src.document_ingestion import SecureDocumentIngestionService
+    from src.database import Database
     from src.auth import (
         AuthenticatedPrincipal,
         AuthenticationError,
@@ -126,6 +128,7 @@ except ImportError:
     from rag_system import RAGSystem
     from audit_logger import SecurityAuditLogger
     from document_ingestion import SecureDocumentIngestionService
+    from database import Database
     from auth import (
         AuthenticatedPrincipal,
         AuthenticationError,
@@ -177,14 +180,25 @@ bearer_scheme = HTTPBearer(
     auto_error=False,
 )
 
-# Local-development authentication stores.
+# Persistent application state.
 #
-# Production deployments should replace UserStore with persistent storage
-# and provide a stable RAGSHIELD_AUTH_SECRET.
+# SQLite is the Phase K local persistence backend. The database path can
+# be overridden for deployment or testing without changing application code.
 
-user_store = UserStore()
+database = Database(
+    os.getenv(
+        "RAGSHIELD_DATABASE_PATH",
+        "./data/ragshield.db",
+    )
+)
 
-token_manager = TokenManager()
+user_store = UserStore(
+    database=database,
+)
+
+token_manager = TokenManager(
+    database=database,
+)
 
 rbac = RBAC()
 
