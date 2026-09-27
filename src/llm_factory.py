@@ -97,7 +97,7 @@ class LLMFactory:
             openai_api_base=(
                 f"{config.openai_compat_base_url}/v1"
             ),
-            openai_api_key="dummy-key",
+            openai_api_key=os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or "dummy-key",
             temperature=0,
             max_tokens=128,
             extra_body={
