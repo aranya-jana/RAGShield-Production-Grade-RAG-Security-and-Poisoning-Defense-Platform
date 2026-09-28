@@ -1567,12 +1567,12 @@ def info():
 
             "version": "1.0.0",
 
-            "llm_provider": "ollama",
+            "llm_provider": os.getenv("LLM_PROVIDER", "ollama"),
 
-            "llm_model": getattr(
-                config,
-                "ollama_model",
-                "phi4-mini:latest",
+            "llm_model": (
+                getattr(config, "openai_compat_model", "local-model")
+                if os.getenv("LLM_PROVIDER", "ollama").strip().lower() == "openai-compat"
+                else getattr(config, "ollama_model", "phi4-mini:latest")
             ),
 
             "embedding_model": getattr(
