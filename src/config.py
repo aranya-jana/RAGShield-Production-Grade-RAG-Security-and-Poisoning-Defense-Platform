@@ -33,7 +33,7 @@ class Config:
         os.environ['SENTENCE_TRANSFORMERS_HOME'] = os.getenv('SENTENCE_TRANSFORMERS_HOME', './models/embedding')
         os.environ['HF_HOME'] = os.getenv('SENTENCE_TRANSFORMERS_HOME', './models/embedding')
         os.environ['HF_DATASETS_CACHE'] = os.getenv('SENTENCE_TRANSFORMERS_HOME', './models/embedding')
-        os.environ['TRANSFORMERS_OFFLINE'] = '1'  # Force offline mode
+        os.environ['TRANSFORMERS_OFFLINE'] = os.getenv('TRANSFORMERS_OFFLINE', '0')
     
     def _load_api_keys(self):
         """Load API keys from .keys file"""
