@@ -1575,10 +1575,24 @@ def info():
                 else getattr(config, "ollama_model", "phi4-mini:latest")
             ),
 
-            "embedding_model": getattr(
+            "embedding_provider": getattr(
                 config,
-                "embedding_model",
-                "sentence-transformers/all-MiniLM-L6-v2",
+                "embedding_provider",
+                "onnx",
+            ),
+
+            "embedding_model": (
+                getattr(
+                    config,
+                    "openrouter_embedding_model",
+                    "nvidia/nemotron-3-embed-1b:free",
+                )
+                if getattr(config, "embedding_provider", "onnx") == "openrouter"
+                else getattr(
+                    config,
+                    "embedding_model",
+                    "sentence-transformers/all-MiniLM-L6-v2",
+                )
             ),
         }
 

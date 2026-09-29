@@ -222,14 +222,71 @@ class ChromaONNXEmbeddings:
         return list(self._embedding_function([text]))[0]
 
 
+class OpenRouterEmbeddings:
+    """
+    LangChain-compatible embeddings backed by an OpenRouter
+    OpenAI-compatible embeddings endpoint.
+    """
+
+    def __init__(self, model):
+        from langchain_openai import OpenAIEmbeddings
+
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "OPENROUTER_API_KEY is required when "
+                "EMBEDDING_PROVIDER=openrouter."
+            )
+
+        self._embeddings = OpenAIEmbeddings(
+            model=model,
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
+            chunk_size=100,
+            tiktoken_enabled=False,
+            default_headers={
+                "HTTP-Referer": "https://ragshield-frontend-hso4.onrender.com",
+                "X-OpenRouter-Title": "RAGShield",
+            },
+        )
+
+    def embed_documents(self, texts):
+        """Embed multiple documents."""
+        return self._embeddings.embed_documents(list(texts))
+
+    def embed_query(self, text):
+        """Embed a single query."""
+        return self._embeddings.embed_query(text)
+
+
 def create_embeddings(config):
     """
-    Create the lightweight ONNX embedding model used by the RAG system.
+    Create embeddings according to EMBEDDING_PROVIDER.
+
+    Supported providers:
+      - onnx: local Chroma ONNX MiniLM embeddings.
+      - openrouter: OpenRouter-hosted embedding model.
     """
 
-    print(
-        "Using Chroma ONNX embedding model: "
-        "all-MiniLM-L6-v2 (384 dimensions)"
-    )
+    provider = config.embedding_provider
 
-    return ChromaONNXEmbeddings()
+    if provider == "onnx":
+        print(
+            "Using Chroma ONNX embedding model: "
+            "all-MiniLM-L6-v2 (384 dimensions)"
+        )
+        return ChromaONNXEmbeddings()
+
+    if provider == "openrouter":
+        print(
+            "Using OpenRouter embedding model: "
+            f"{config.openrouter_embedding_model}"
+        )
+        return OpenRouterEmbeddings(
+            model=config.openrouter_embedding_model
+        )
+
+    raise ValueError(
+        f"Unsupported embedding provider: '{provider}'. "
+        "Supported providers: onnx, openrouter."
+    )

@@ -74,8 +74,19 @@ class Config:
         return os.getenv('LLAMA_MODEL_PATH', "./models/llm/Phi-3.5-mini-instruct.Q4_K_M.gguf")
     
     @property
+    def embedding_provider(self):
+        return os.getenv('EMBEDDING_PROVIDER', 'onnx').strip().lower()
+
+    @property
     def embedding_model(self):
         return os.getenv('EMBEDDING_MODEL', "sentence-transformers/all-MiniLM-L6-v2")
+
+    @property
+    def openrouter_embedding_model(self):
+        return os.getenv(
+            'OPENROUTER_EMBEDDING_MODEL',
+            'nvidia/nemotron-3-embed-1b:free'
+        )
     
     @property
     def vector_db_path(self):
