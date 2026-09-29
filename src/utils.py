@@ -2,7 +2,6 @@
 Device and utility functions for RAG Poisoning Demo
 """
 
-import torch
 import platform
 import sys
 import os
@@ -13,9 +12,12 @@ logger = logging.getLogger(__name__)
 
 
 def get_device(forced_device=None):
-    """Determine the best device for computation"""
+    """Determine the best device for computation."""
     if forced_device:
         return forced_device
+
+    import torch
+
     if torch.cuda.is_available():
         return 'cuda'
     elif sys.platform == 'darwin' and platform.machine() == 'arm64':
