@@ -198,23 +198,38 @@ def create_llm(config, provider=None, device=None):
 # Embeddings
 # ----------------------------------------------------------------------
 
+class ChromaONNXEmbeddings:
+    """
+    Lightweight LangChain-compatible adapter for Chroma's ONNX MiniLM
+    embedding function.
+
+    This avoids loading PyTorch/SentenceTransformers in constrained
+    production environments while preserving the embed_query and
+    embed_documents interface used by the RAG system.
+    """
+
+    def __init__(self):
+        from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
+
+        self._embedding_function = ONNXMiniLM_L6_V2()
+
+    def embed_documents(self, texts):
+        """Embed multiple documents."""
+        return list(self._embedding_function(list(texts)))
+
+    def embed_query(self, text):
+        """Embed a single query."""
+        return list(self._embedding_function([text]))[0]
+
+
 def create_embeddings(config):
     """
-    Create the embedding model used by the RAG system.
+    Create the lightweight ONNX embedding model used by the RAG system.
     """
 
-    from langchain_huggingface import HuggingFaceEmbeddings
-
     print(
-        f"Using embedding model: {config.embedding_model}"
+        "Using Chroma ONNX embedding model: "
+        "all-MiniLM-L6-v2 (384 dimensions)"
     )
 
-    return HuggingFaceEmbeddings(
-        model_name=config.embedding_model,
-        model_kwargs={
-            "device": "cpu"
-        },
-        encode_kwargs={
-            "normalize_embeddings": True
-        }
-    )
+    return ChromaONNXEmbeddings()
