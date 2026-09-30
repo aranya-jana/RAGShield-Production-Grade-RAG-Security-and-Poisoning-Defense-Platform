@@ -105,6 +105,7 @@ try:
         create_embeddings,
         create_llm,
     )
+    from src.lite_query import run_lite_query
     from src.rag_system import RAGSystem
     from src.audit_logger import SecurityAuditLogger
     from src.document_ingestion import SecureDocumentIngestionService
@@ -1566,6 +1567,7 @@ def info():
             "name": "RAG Poisoning Detection",
 
             "version": "1.0.0",
+            "deployment_mode": os.getenv("RAGSHIELD_DEPLOYMENT_MODE", "full").strip().lower(),
 
             "llm_provider": os.getenv("LLM_PROVIDER", "ollama"),
 
@@ -2121,8 +2123,6 @@ def query(
 
     try:
 
-        rag = get_rag_system()
-
         query_text = request.query.strip()
 
         if not query_text:
@@ -2139,8 +2139,47 @@ def query(
         )
 
         # --------------------------------------------------------------
-        # Execute protected RAG
+        # Explicit constrained-deployment Lite mode
         # --------------------------------------------------------------
+
+        if os.getenv(
+            "RAGSHIELD_DEPLOYMENT_MODE",
+            "full",
+        ).strip().lower() == "lite":
+
+            lite_result = run_lite_query(
+                query_text
+            )
+
+            return QueryResponse(
+                query=lite_result["query"],
+                answer=lite_result["answer"],
+                security=SecurityResponse(
+                    **lite_result["security"]
+                ),
+                retrieved_documents=[
+                    DocumentResponse(
+                        **document
+                    )
+                    for document in lite_result[
+                        "retrieved_documents"
+                    ]
+                ],
+                blocked_documents=[
+                    DocumentResponse(
+                        **document
+                    )
+                    for document in lite_result[
+                        "blocked_documents"
+                    ]
+                ],
+            )
+
+        # --------------------------------------------------------------
+        # Execute protected full RAG
+        # --------------------------------------------------------------
+
+        rag = get_rag_system()
 
         result = rag.query(
             query_text
@@ -2831,3 +2870,4 @@ def startup_event():
     logger.info(
         "=================================================="
     )
+
