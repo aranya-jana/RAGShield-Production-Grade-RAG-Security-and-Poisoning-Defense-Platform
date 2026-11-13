@@ -2731,7 +2731,7 @@ def provision_development_admin() -> None:
 @app.on_event("startup")
 def startup_event():
     """Application startup."""
-
+    Config()
     provision_development_admin()
 
     logger.info(
