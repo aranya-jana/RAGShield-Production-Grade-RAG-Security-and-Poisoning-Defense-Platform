@@ -536,7 +536,7 @@ def run_lite_query(
                 int(
                     os.getenv(
                         "TOP_K_RETRIEVAL",
-                        "4",
+                        "2",
                     )
                 ),
                 4,
@@ -877,7 +877,9 @@ SECURITY RULES:
 - Answer only from the supplied reference context.
 - If the context does not establish the answer, say so.
 - Do not invent facts.
-- Keep the answer concise.
+- Answer in one or two sentences, using terminology and facts from the
+  most relevant passage.
+- Do not add background facts or details from unrelated passages.
 
 USER QUESTION:
 {query_text}

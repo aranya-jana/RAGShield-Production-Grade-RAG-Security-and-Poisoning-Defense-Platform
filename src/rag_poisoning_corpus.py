@@ -15,6 +15,23 @@ def create_benign_corpus() -> List[Document]:
     benign_docs = [
         {
             "content": """
+            # Retrieval-Augmented Generation (RAG)
+
+            Retrieval-augmented generation (RAG) is an approach that combines
+            information retrieval with text generation. A RAG system first
+            retrieves relevant passages from a reference collection, then
+            provides those passages to a language model as context for
+            answering the user's question. This can ground answers in the
+            supplied sources and make it possible to use current or
+            domain-specific information without retraining the language model.
+            The quality of a RAG answer depends on retrieving relevant,
+            trustworthy sources and checking that the answer is supported by
+            them.
+            """,
+            "metadata": {"source": "rag_fundamentals.md", "type": "benign"}
+        },
+        {
+            "content": """
             # Cloud Computing Overview
             
             Cloud computing is a technology that provides on-demand access to computing 

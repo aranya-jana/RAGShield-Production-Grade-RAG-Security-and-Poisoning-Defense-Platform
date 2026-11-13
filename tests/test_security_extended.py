@@ -746,12 +746,28 @@ def test_safe_answer_is_generated_after_attack_is_blocked():
         ],
     )
 
+    def safe_invoke(prompt):
+        rag.llm.calls.append(prompt)
+        return type(
+            "MockResponse",
+            (),
+            {
+                "content": (
+                    "Cloud computing provides on-demand access "
+                    "to computing resources over the internet."
+                )
+            },
+        )()
+
+    rag.llm.invoke = safe_invoke
+
     result = rag.query(
         "What is cloud computing?"
     )
 
     assert result["result"] == (
-        "Safe answer generated from trusted context."
+        "Cloud computing provides on-demand access "
+        "to computing resources over the internet."
     )
 
     assert len(rag.llm.calls) == 1
@@ -759,3 +775,100 @@ def test_safe_answer_is_generated_after_attack_is_blocked():
     assert len(result["blocked_documents"]) == 1
 
     assert len(result["source_documents"]) == 1
+
+
+class RecordingAuditLogger:
+    """Keep audit events in memory for isolated integration tests."""
+
+    def __init__(self):
+        self.events = []
+
+    def log_event(self, **kwargs):
+        self.events.append(kwargs)
+        return kwargs
+
+
+def run_query_with_mock_answer(answer, trusted_content):
+    trusted = make_document(
+        trusted_content,
+        source="trusted.md",
+    )
+    rag = create_test_rag(
+        retrieved_documents=[trusted],
+        trusted_documents=[trusted],
+    )
+    rag.audit_logger = RecordingAuditLogger()
+
+    def mock_invoke(prompt):
+        rag.llm.calls.append(prompt)
+        return type(
+            "MockResponse",
+            (),
+            {"content": answer},
+        )()
+
+    rag.llm.invoke = mock_invoke
+    result = rag.query("What is cloud computing?")
+    completed_events = [
+        event for event in rag.audit_logger.events
+        if event["event_type"] == "query_completed"
+    ]
+    assert len(completed_events) == 1
+    return rag, result, completed_events[0]
+
+
+def test_validated_answer_records_protected_audit_status():
+    evidence = (
+        "Cloud computing provides on-demand access "
+        "to computing resources over the internet."
+    )
+    rag, result, audit_event = run_query_with_mock_answer(
+        evidence,
+        evidence,
+    )
+
+    assert result["result"] == evidence
+    assert audit_event["status"] == "PROTECTED"
+
+
+def test_unsupported_answer_records_insufficient_evidence():
+    evidence = (
+        "Cloud computing provides on-demand access "
+        "to computing resources over the internet."
+    )
+    rag, result, audit_event = run_query_with_mock_answer(
+        "The moon is made entirely of cheese.",
+        evidence,
+    )
+
+    assert result["result"] == (
+        "I could not provide a verified answer from the "
+        "available trusted reference material."
+    )
+    assert audit_event["status"] == "INSUFFICIENT_EVIDENCE"
+    assert any(
+        event["status"] == "INSUFFICIENT_EVIDENCE"
+        for event in result["security_events"]
+    )
+
+
+def test_contradictory_answer_records_insufficient_evidence():
+    evidence = (
+        "Cloud computing provides on-demand access "
+        "to computing resources over the internet."
+    )
+    contradictory_answer = (
+        "Cloud computing does not provide on-demand access "
+        "to computing resources over the internet."
+    )
+    rag, result, audit_event = run_query_with_mock_answer(
+        contradictory_answer,
+        evidence,
+    )
+
+    assert result["result"] == (
+        "I could not provide a verified answer from the "
+        "available trusted reference material."
+    )
+    assert audit_event["status"] == "INSUFFICIENT_EVIDENCE"
+

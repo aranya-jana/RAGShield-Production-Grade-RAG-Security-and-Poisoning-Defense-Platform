@@ -29,10 +29,14 @@ from __future__ import annotations
 
 import logging
 import os
+from dotenv import load_dotenv
 import time
 import uuid
 from pathlib import Path
 from typing import List, Optional
+
+# Load configuration before module-level services read environment variables.
+load_dotenv()
 
 
 from src.request_size_limit import RequestSizeLimitMiddleware
@@ -2215,9 +2219,16 @@ def query(
             if event.status == "BLOCKED"
         )
 
+        insufficient_evidence = any(
+            event.status == "INSUFFICIENT_EVIDENCE"
+            for event in security_events
+        )
+
         security_status = (
             "BLOCKED"
             if blocked_count > 0
+            else "INSUFFICIENT_EVIDENCE"
+            if insufficient_evidence
             else "SAFE"
         )
 
@@ -2704,7 +2715,8 @@ def get_audit(
                     ),
 
                     endpoint=metadata.get(
-                        "path"
+                        "endpoint",
+                        metadata.get("path"),
                     ),
                 )
             )

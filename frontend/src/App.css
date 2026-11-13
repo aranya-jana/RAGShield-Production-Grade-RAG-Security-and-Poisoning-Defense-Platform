@@ -1741,6 +1741,10 @@ textarea:disabled {
   border-color: rgba(239, 107, 121, 0.25);
 }
 
+.query-result-insufficient {
+  border-color: rgba(230, 173, 75, 0.28);
+}
+
 .query-result-header {
   display: flex;
   align-items: center;
@@ -1762,6 +1766,10 @@ textarea:disabled {
 
 .query-result-blocked .query-result-status > svg {
   color: var(--danger);
+}
+
+.query-result-insufficient .query-result-status > svg {
+  color: #e6ad4b;
 }
 
 .query-result-status span {
@@ -1794,6 +1802,11 @@ textarea:disabled {
 .result-status-blocked {
   color: #f09ba4;
   background: var(--danger-soft);
+}
+
+.result-status-insufficient {
+  color: #f0c477;
+  background: rgba(230, 173, 75, 0.12);
 }
 
 .answer-section {

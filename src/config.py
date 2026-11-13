@@ -45,7 +45,7 @@ class Config:
                         key, value = line.strip().split('=', 1)
                         os.environ[key.strip()] = value.strip().strip('"').strip("'")
         else:
-            print("⚠️ No .keys file found. Some API services might not work.")
+            print("No .keys file found. Some API services might not work.")
     
     def _setup_logging(self):
         """Setup logging configuration"""

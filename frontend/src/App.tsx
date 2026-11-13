@@ -4294,12 +4294,18 @@ function QueryResultPanel({
     result.security.status ===
     "BLOCKED";
 
+  const insufficientEvidence =
+    result.security.status ===
+    "INSUFFICIENT_EVIDENCE";
+
   return (
     <motion.div
       className={`query-result ${
         blocked
           ? "query-result-blocked"
-          : "query-result-safe"
+          : insufficientEvidence
+            ? "query-result-insufficient"
+            : "query-result-safe"
       }`}
       initial={{
         opacity: 0,
@@ -4316,6 +4322,10 @@ function QueryResultPanel({
             <ShieldAlert
               size={19}
             />
+          ) : insufficientEvidence ? (
+            <AlertTriangle
+              size={19}
+            />
           ) : (
             <ShieldCheck
               size={19}
@@ -4330,7 +4340,9 @@ function QueryResultPanel({
             <strong>
               {blocked
                 ? "Threat Intercepted"
-                : "Protected"}
+                : insufficientEvidence
+                  ? "Insufficient Evidence"
+                  : "Protected"}
             </strong>
           </div>
         </div>
@@ -4339,7 +4351,9 @@ function QueryResultPanel({
           className={`result-status-badge ${
             blocked
               ? "result-status-blocked"
-              : "result-status-safe"
+              : insufficientEvidence
+                ? "result-status-insufficient"
+                : "result-status-safe"
           }`}
         >
           {result.security.status}

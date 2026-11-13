@@ -36,15 +36,12 @@ def check_local_model_exists(model_name, cache_dir):
     return False
 
 
-def create_chromadb_client(db_path):
-    """Create ChromaDB client with proper path handling"""
+def create_chromadb_client(db_path=None):
+    """Create a persistent local ChromaDB client."""
     import chromadb
-    
-    if db_path and os.path.exists(db_path):
-        return chromadb.PersistentClient(path=db_path)
-    else:
-        # Fall back to in-memory client for testing
-        return chromadb.Client()
+    return chromadb.PersistentClient(
+        path=db_path or "./data/chroma_db",
+    )
 
 
 def create_test_collection(client, base_name="test_collection"):

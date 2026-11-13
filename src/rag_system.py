@@ -24,6 +24,7 @@ from src.utils import (
 )
 
 from src.audit_logger import SecurityAuditLogger
+from src.security_telemetry import safe_content_metadata
 
 try:
     from src.document_injection_detector import DocumentInjectionDetector
@@ -54,6 +55,11 @@ try:
     from src.output_dlp import OutputDLP
 except ImportError:
     from output_dlp import OutputDLP
+
+try:
+    from src.output_validator import OutputValidator
+except ImportError:
+    from output_validator import OutputValidator
 
 
 
@@ -244,7 +250,7 @@ class RAGSystem:
                 )
 
         self.vectorstore = Chroma(
-            persist_directory=self.config.vector_db_path,
+            client=create_chromadb_client(self.config.vector_db_path),
             embedding_function=self.embeddings,
             collection_name=self.collection_name,
         )
@@ -310,16 +316,20 @@ class RAGSystem:
 
         try:
 
+            audit_metadata = dict(metadata or {})
+            if query is not None:
+                audit_metadata["request_content"] = safe_content_metadata(query)
+
             self.audit_logger.log_event(
                 event_type=event_type,
-                query=query,
+                query=None,
                 source=source,
                 document_type=document_type,
                 detector=detector,
                 score=score,
                 status=status,
                 reasons=reasons,
-                metadata=metadata,
+                metadata=audit_metadata,
             )
 
         except Exception as exc:
@@ -1198,7 +1208,9 @@ class RAGSystem:
         """
 
         logger.info(
-            f"Starting protected RAG query: {query_text}"
+            "Starting protected RAG query: length=%d sha256=%s",
+            len(query_text),
+            safe_content_metadata(query_text)["content_sha256"],
         )
 
         # Reset per-query state.
@@ -1340,7 +1352,7 @@ class RAGSystem:
         requested_k = (
             self.config.top_k_retrieval
             if self.config.top_k_retrieval is not None
-            else 4
+            else 2
         )
 
         retriever = self.vectorstore.as_retriever(
@@ -2000,7 +2012,10 @@ class RAGSystem:
             "UNTRUSTED CONTEXT END\n\n"
             f"USER QUESTION:\n{query_text}\n\n"
             "Answer using only relevant factual information from the "
-            "reference context and the user's question:"
+            "reference context and the user's question. Keep the answer "
+            "to one or two sentences. Use the terminology and facts from "
+            "the most relevant passage, and do not add related background "
+            "or facts from other topics:"
         )
 
         # --------------------------------------------------------------
@@ -2041,6 +2056,11 @@ class RAGSystem:
                 {
                     "type": "OutputDLP",
                     "detector": "OutputDLP",
+                    "score": float(output_dlp.detection.score),
+                    "status": "BLOCKED",
+                    "is_poisoned": False,
+                    "is_contradictory": False,
+                    "reasons": list(output_dlp.reasons),
                     "severity": "CRITICAL",
                     "risk_score": 100,
                     "classification": "BLOCKED",
@@ -2067,6 +2087,11 @@ class RAGSystem:
                 {
                     "type": "OutputDLP",
                     "detector": "OutputDLP",
+                    "score": float(output_dlp.detection.score),
+                    "status": "REDACTED",
+                    "is_poisoned": False,
+                    "is_contradictory": False,
+                    "reasons": list(output_dlp.reasons),
                     "severity": "HIGH",
                     "risk_score": 60,
                     "classification": "REDACTED",
@@ -2094,14 +2119,59 @@ class RAGSystem:
                 metadata=self._output_dlp_metadata(output_dlp),
             )
 
+        # Apply evidence validation in full mode too. An unverified answer is
+        # replaced with a safe response and reported as a blocked event.
+        output_validator = OutputValidator()
+        validation_result = output_validator.validate(
+            answer,
+            safe_documents,
+        )
+        final_audit_status = (
+            "PROTECTED"
+            if validation_result.is_valid
+            else "INSUFFICIENT_EVIDENCE"
+        )
+        if not validation_result.is_valid:
+            validation_score = max(
+                0.0,
+                1.0 - float(validation_result.score),
+            )
+            validation_reasons = list(validation_result.reasons)
+            validation_details = output_validator.safe_audit(validation_result)
+            answer = (
+                "I could not provide a verified answer from the "
+                "available trusted reference material."
+            )
+            self.security_events.append(
+                {
+                    "type": "OutputValidator",
+                    "detector": "OutputValidator",
+                    "score": validation_score,
+                    "status": "INSUFFICIENT_EVIDENCE",
+                    "is_poisoned": False,
+                    "is_contradictory": False,
+                    "reasons": validation_reasons,
+                    "validation": validation_details,
+                }
+            )
+            self._write_audit_event(
+                event_type="output_validation_insufficient_evidence",
+                query=query_text,
+                detector="OutputValidator",
+                score=validation_score,
+                status="INSUFFICIENT_EVIDENCE",
+                reasons=validation_reasons,
+                metadata=validation_details,
+            )
+
         # --------------------------------------------------------------
-        # Audit successful protected query
+        # Audit the final query outcome
         # --------------------------------------------------------------
 
         self._write_audit_event(
             event_type="query_completed",
             query=query_text,
-            status="PROTECTED",
+            status=final_audit_status,
             metadata={
                 "retrieved_count": len(
                     source_documents
