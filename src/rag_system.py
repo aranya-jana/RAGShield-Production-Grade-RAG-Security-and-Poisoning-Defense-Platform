@@ -2032,16 +2032,42 @@ class RAGSystem:
             prompt
         )
 
-        if hasattr(
-            response,
-            "content",
-        ):
-
+        if hasattr(response, "content"):
             answer = response.content
-
         else:
-
             answer = str(response)
+
+        # OpenAI-compatible providers may return an HTTP 200 response with an
+        # empty content field (free inference endpoints can do this under
+        # load). Normalize the common structured content form and never let
+        # that become a blank answer in the UI.
+        if answer is None:
+            answer = ""
+        elif isinstance(answer, list):
+            answer = "".join(
+                block.get("text", "") if isinstance(block, dict) else str(block)
+                for block in answer
+            )
+        answer = answer.strip() if isinstance(answer, str) else str(answer).strip()
+        model_returned_empty = not answer
+        if model_returned_empty:
+            answer = (
+                "The configured free model returned an empty response. "
+                "Please try your query again."
+            )
+            self.security_events.append(
+                {
+                    "type": "LLMResponse",
+                    "detector": "LLMResponse",
+                    "status": "EMPTY_RESPONSE",
+                    "reason": "The model returned no answer text.",
+                }
+            )
+            self._write_audit_event(
+                event_type="llm_empty_response",
+                query=query_text,
+                status="EMPTY_RESPONSE",
+            )
 
         # --------------------------------------------------------------
         # Final DLP gate
@@ -2163,6 +2189,16 @@ class RAGSystem:
                 reasons=validation_reasons,
                 metadata=validation_details,
             )
+
+        # Keep the actionable provider message if the model itself returned
+        # no content; evidence validation must not replace it with an unrelated
+        # generic answer.
+        if model_returned_empty:
+            answer = (
+                "The configured free model returned an empty response. "
+                "Please try your query again."
+            )
+            final_audit_status = "MODEL_EMPTY_RESPONSE"
 
         # --------------------------------------------------------------
         # Audit the final query outcome
