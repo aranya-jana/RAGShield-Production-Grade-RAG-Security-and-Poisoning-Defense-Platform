@@ -2028,9 +2028,20 @@ class RAGSystem:
         # LLM
         # --------------------------------------------------------------
 
-        response = self.llm.invoke(
-            prompt
-        )
+        model_request_failed = False
+        model_error_type = None
+        try:
+            response = self.llm.invoke(prompt)
+        except Exception as exc:
+            # Provider outages, free-tier limits, or removed model IDs should
+            # not turn an otherwise protected query into an HTTP 500.
+            logger.warning(
+                "LLM request failed (%s)",
+                type(exc).__name__,
+            )
+            response = None
+            model_request_failed = True
+            model_error_type = type(exc).__name__
 
         if hasattr(response, "content"):
             answer = response.content
@@ -2049,12 +2060,34 @@ class RAGSystem:
                 for block in answer
             )
         answer = answer.strip() if isinstance(answer, str) else str(answer).strip()
-        model_returned_empty = not answer
-        if model_returned_empty:
-            answer = (
+        model_returned_empty = not answer and not model_request_failed
+        model_fallback = None
+        if model_request_failed:
+            model_fallback = (
+                "The free model service is temporarily unavailable. "
+                "Please try again in a little while."
+            )
+            answer = model_fallback
+            self.security_events.append(
+                {
+                    "type": "LLMResponse",
+                    "detector": "LLMResponse",
+                    "status": "MODEL_UNAVAILABLE",
+                    "reason": "The configured model request failed.",
+                }
+            )
+            self._write_audit_event(
+                event_type="llm_request_failed",
+                query=query_text,
+                status="MODEL_UNAVAILABLE",
+                metadata={"error_type": model_error_type},
+            )
+        elif model_returned_empty:
+            model_fallback = (
                 "The configured free model returned an empty response. "
                 "Please try your query again."
             )
+            answer = model_fallback
             self.security_events.append(
                 {
                     "type": "LLMResponse",
@@ -2193,12 +2226,13 @@ class RAGSystem:
         # Keep the actionable provider message if the model itself returned
         # no content; evidence validation must not replace it with an unrelated
         # generic answer.
-        if model_returned_empty:
-            answer = (
-                "The configured free model returned an empty response. "
-                "Please try your query again."
+        if model_fallback:
+            answer = model_fallback
+            final_audit_status = (
+                "MODEL_UNAVAILABLE"
+                if model_request_failed
+                else "MODEL_EMPTY_RESPONSE"
             )
-            final_audit_status = "MODEL_EMPTY_RESPONSE"
 
         # --------------------------------------------------------------
         # Audit the final query outcome
@@ -2218,7 +2252,7 @@ class RAGSystem:
                 "blocked_count": len(
                     blocked_documents
                 ),
-                "llm_called": True,
+                "llm_called": not model_request_failed,
                 "risk_engine": "RiskTrustEngine",
                 "provenance_integrity": "verified_for_provenance_documents",
             },
