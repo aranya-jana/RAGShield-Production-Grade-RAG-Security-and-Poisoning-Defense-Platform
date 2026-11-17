@@ -1355,10 +1355,30 @@ class RAGSystem:
             else 2
         )
 
+        # Security scanning must not be limited to the small number of
+        # documents that will eventually be used as answer context. In the
+        # controlled poisoning corpus, a malicious document can otherwise
+        # rank just below top_k and never reach the retrieval-time detector.
+        # Scan up to 50 nearest candidates (or the whole collection when it
+        # is smaller), then keep only the most relevant safe documents below.
+        try:
+            collection_count = int(
+                self.vectorstore._collection.count()
+            )
+            security_scan_k = min(
+                max(requested_k, collection_count),
+                50,
+            )
+        except Exception:
+            security_scan_k = min(
+                max(requested_k * 5, requested_k),
+                50,
+            )
+
         retriever = self.vectorstore.as_retriever(
             search_type="similarity",
             search_kwargs={
-                "k": requested_k,
+                "k": security_scan_k,
             },
         )
 
@@ -1883,9 +1903,11 @@ class RAGSystem:
                 metadata_score=metadata_score,
             )
 
-            safe_documents.append(
-                doc
-            )
+            # Candidate documents beyond the configured answer-context size
+            # are still scanned and reported, but never dilute answer
+            # relevance by being added to the model context.
+            if len(safe_documents) < requested_k:
+                safe_documents.append(doc)
 
             safe_event = {
                 "source": source,
